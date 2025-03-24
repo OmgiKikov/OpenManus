@@ -2,8 +2,7 @@ import asyncio
 import time
 
 from app.agent.manus import Manus
-from app.flow.base import FlowType
-from app.flow.flow_factory import FlowFactory
+from app.flow.flow_factory import FlowType, FlowFactory
 from app.logger import logger
 
 
@@ -26,6 +25,12 @@ async def run_flow():
         logger.warning("Processing your request...")
 
         try:
+            # Выводим начальный план до выполнения
+            if hasattr(flow, "planning_tool") and hasattr(flow, "active_plan_id"):
+                # Важно: нельзя запрашивать план до его создания
+                # Запрос состояния плана произойдет внутри flow.execute()
+                logger.info(f"Using plan ID: {flow.active_plan_id}")
+
             start_time = time.time()
             result = await asyncio.wait_for(
                 flow.execute(prompt),
@@ -33,6 +38,16 @@ async def run_flow():
             )
             elapsed_time = time.time() - start_time
             logger.info(f"Request processed in {elapsed_time:.2f} seconds")
+
+            # Выводим финальный план после выполнения
+            if hasattr(flow, "planning_tool") and hasattr(flow, "active_plan_id"):
+                final_plan_result = await flow.planning_tool.execute(
+                    command="get",
+                    plan_id=flow.active_plan_id
+                )
+                if hasattr(final_plan_result, "output"):
+                    logger.info(f"FINAL PLAN STATUS:\n{final_plan_result.output}")
+
             logger.info(result)
         except asyncio.TimeoutError:
             logger.error("Request processing timed out after 1 hour")
