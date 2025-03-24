@@ -25,10 +25,7 @@ async def run_flow():
         logger.warning("Processing your request...")
 
         try:
-            # Выводим начальный план до выполнения
             if hasattr(flow, "planning_tool") and hasattr(flow, "active_plan_id"):
-                # Важно: нельзя запрашивать план до его создания
-                # Запрос состояния плана произойдет внутри flow.execute()
                 logger.info(f"Using plan ID: {flow.active_plan_id}")
 
             start_time = time.time()
@@ -39,7 +36,6 @@ async def run_flow():
             elapsed_time = time.time() - start_time
             logger.info(f"Request processed in {elapsed_time:.2f} seconds")
 
-            # Выводим финальный план после выполнения
             if hasattr(flow, "planning_tool") and hasattr(flow, "active_plan_id"):
                 final_plan_result = await flow.planning_tool.execute(
                     command="get",
