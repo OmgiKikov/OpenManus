@@ -4,13 +4,11 @@ import time
 from app.agent.manus import Manus
 from app.flow.flow_factory import FlowFactory, FlowType
 from app.logger import logger
-from app.tool.ask_human import AskHuman
 from app.tool.planning import PlanningTool
 
 
 async def run_flow():
     manus_agent = Manus()
-    manus_agent.available_tools.add_tool(AskHuman())
     planning_tool_instance = PlanningTool()
     manus_agent.available_tools.add_tool(planning_tool_instance)
 
