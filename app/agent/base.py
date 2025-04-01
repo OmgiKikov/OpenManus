@@ -1,6 +1,7 @@
+import asyncio
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Callable, Coroutine, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -8,6 +9,19 @@ from app.llm import LLM
 from app.logger import logger
 from app.sandbox.client import SANDBOX_CLIENT
 from app.schema import ROLE_TYPE, AgentState, Memory, Message
+
+# Define the type hint for the async callback function
+WebSocketCallback = Callable[[Dict], Coroutine[None, None, None]]
+
+# Add import for HumanInterventionRequired at the top of the file if not already present
+# from app.tool.ask_human import HumanInterventionRequired
+# Assuming it might be used elsewhere, let's ensure it's available
+try:
+    from app.tool.ask_human import HumanInterventionRequired
+except ImportError:
+    # Define a dummy exception if the tool isn't present,
+    # so the except block below doesn't cause a NameError
+    class HumanInterventionRequired(Exception): pass
 
 
 class BaseAgent(BaseModel, ABC):
@@ -41,6 +55,11 @@ class BaseAgent(BaseModel, ABC):
     current_step: int = Field(default=0, description="Current step in execution")
 
     duplicate_threshold: int = 2
+
+    # Add optional websocket_callback field
+    websocket_callback: Optional[WebSocketCallback] = Field(
+        default=None, description="Optional callback for sending WebSocket updates"
+    )
 
     class Config:
         arbitrary_types_allowed = True
@@ -113,6 +132,18 @@ class BaseAgent(BaseModel, ABC):
         kwargs = {"base64_image": base64_image, **(kwargs if role == "tool" else {})}
         self.memory.add_message(message_map[role](content, **kwargs))
 
+    # Add the send_update helper method
+    async def send_update(self, update_data: dict):
+        """Helper method to safely send updates via the WebSocket callback."""
+        if self.websocket_callback:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.websocket_callback(update_data))
+            except Exception as e:
+                logger.error(f"Error sending WebSocket update from Agent {self.name}: {e}", exc_info=True)
+        else:
+            logger.debug(f"Agent {self.name}: No websocket_callback configured, update not sent: {update_data}")
+
     async def run(self, request: Optional[str] = None) -> str:
         """Execute the agent's main loop asynchronously.
 
@@ -128,30 +159,128 @@ class BaseAgent(BaseModel, ABC):
         if self.state != AgentState.IDLE:
             raise RuntimeError(f"Cannot run agent from state: {self.state}")
 
+        await self.send_update({"type": "agent_status", "agent": self.name, "text": "Starting run..."})
+
         if request:
             self.update_memory("user", request)
+            await self.send_update({"type": "memory_update", "agent": self.name, "role": "user", "content": request})
 
         results: List[str] = []
-        async with self.state_context(AgentState.RUNNING):
-            while (
-                self.current_step < self.max_steps and self.state != AgentState.FINISHED
-            ):
-                self.current_step += 1
-                logger.info(f"Executing step {self.current_step}/{self.max_steps}")
-                step_result = await self.step()
+        final_status_text = "No steps executed"
+        # Ensure state is reset correctly even if HIR occurs
+        original_state = self.state
+        try:
+            # Use state_context for RUNNING state
+            async with self.state_context(AgentState.RUNNING):
+                while (
+                    self.current_step < self.max_steps and self.state != AgentState.FINISHED
+                ):
+                    self.current_step += 1
+                    logger.info(f"Agent '{self.name}' executing step {self.current_step}/{self.max_steps}")
+                    await self.send_update({
+                        "type": "agent_step",
+                        "agent": self.name,
+                        "text": f"Starting step {self.current_step}/{self.max_steps}",
+                        "current_step": self.current_step,
+                        "max_steps": self.max_steps
+                    })
+                    try:
+                        step_result = await self.step()
 
-                # Check for stuck state
-                if self.is_stuck():
-                    self.handle_stuck_state()
+                    except HumanInterventionRequired as hir:
+                        # HIR is not a fatal step error, it should be handled by the caller (Flow)
+                        logger.info(f"Agent '{self.name}' step {self.current_step} requires human input. Propagating.")
+                        await self.send_update({
+                            "type": "agent_status",
+                            "agent": self.name,
+                            "text": f"Step {self.current_step} requires human input.",
+                            "step": self.current_step,
+                            "needs_human_input": True # Add flag
+                        })
+                        # Re-raise the exception to be caught by the Flow
+                        raise hir
+                    except Exception as step_error:
+                        # Handle other exceptions as fatal step errors
+                        logger.error(f"Error during agent {self.name} step {self.current_step}: {step_error}", exc_info=True)
+                        await self.send_update({
+                            "type": "error",
+                            "agent": self.name,
+                            "text": f"Error in step {self.current_step}: {step_error}",
+                            "step": self.current_step
+                        })
+                        self.state = AgentState.ERROR # Move to error state
+                        results.append(f"Step {self.current_step}: Error - {step_error}")
+                        break # Exit loop on step error
 
-                results.append(f"Step {self.current_step}: {step_result}")
+                    # --- Code after successful step execution (if no exception) ---
+                    # Check for stuck state
+                    if self.is_stuck():
+                        await self.send_update({"type": "agent_status", "agent": self.name, "text": "Detected stuck state, attempting recovery..."})
+                        self.handle_stuck_state()
 
-            if self.current_step >= self.max_steps:
-                self.current_step = 0
+                    results.append(f"Step {self.current_step}: {step_result}")
+                    await self.send_update({
+                        "type": "agent_step_result",
+                        "agent": self.name,
+                        "text": f"Step {self.current_step} finished.",
+                        "step": self.current_step,
+                        "result_summary": step_result[:100] + ('...' if len(step_result) > 100 else '')
+                    })
+
+                    # Check agent state after step (e.g., if step sets state to FINISHED)
+                    if self.state == AgentState.FINISHED:
+                        await self.send_update({"type": "agent_status", "agent": self.name, "text": "Agent entered FINISHED state."})
+                        break
+
+                # --- Loop finished --- #
+                if self.state == AgentState.FINISHED:
+                    final_status_text = "Execution finished successfully."
+                elif self.current_step >= self.max_steps:
+                    final_status_text = f"Terminated: Reached max steps ({self.max_steps})"
+                    self.state = AgentState.IDLE # Reset state if terminated by max_steps
+                elif self.state == AgentState.ERROR:
+                     final_status_text = "Terminated due to error."
+                     # State is already ERROR
+                # Note: If loop exited due to HIR, state should still be RUNNING here
+                # The finally block will reset it
+                else:
+                     # Should not happen if loop terminates correctly, but handle just in case
+                     final_status_text = f"Execution ended with unexpected state ({self.state})."
+                     self.state = AgentState.IDLE # Reset to idle as a fallback
+
+        except HumanInterventionRequired as hir_main:
+            # Catch HIR that propagated out of the loop
+            logger.info(f"Agent '{self.name}' run paused for human input.")
+            # State should be RUNNING here, state_context will revert it on exit
+            final_status_text = "Paused for human input."
+            # Re-raise it again so the absolute caller (websocket server via Flow) gets it
+            raise hir_main
+        except Exception as run_error:
+            # Catch any other unexpected errors during the run setup or context exit
+            logger.error(f"Unexpected error during agent '{self.name}' run: {run_error}", exc_info=True)
+            self.state = AgentState.ERROR # Ensure state is error
+            final_status_text = f"Run failed with unexpected error: {run_error}"
+            await self.send_update({"type": "error", "agent": self.name, "text": final_status_text})
+        finally:
+            # This block executes even if HIR is raised
+            # Reset step count and potentially state
+            self.current_step = 0
+            # If state is still RUNNING (e.g., HIR occurred), reset to IDLE.
+            # If state is ERROR or FINISHED, leave it as is.
+            if self.state == AgentState.RUNNING:
                 self.state = AgentState.IDLE
-                results.append(f"Terminated: Reached max steps ({self.max_steps})")
-        await SANDBOX_CLIENT.cleanup()
-        return "\n".join(results) if results else "No steps executed"
+                logger.debug(f"Agent '{self.name}' state reset to IDLE after run completion/pause.")
+
+            # Send final status update (unless it was HIR?)
+            # Let's always send a final status for clarity
+            await self.send_update({"type": "agent_status", "agent": self.name, "text": f"Run ended. Final status: {self.state}. {final_status_text}"})
+            logger.info(f"Agent '{self.name}' run finished. Final State: {self.state}. Result summary: {final_status_text}")
+
+            # Sandbox cleanup remains important
+            await SANDBOX_CLIENT.cleanup()
+
+        # Return results collected before error/HIR, or the final status text
+        return "\n".join(results) if results else final_status_text
 
     @abstractmethod
     async def step(self) -> str:
