@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Union, Dict
 
 from pydantic import Field
 
@@ -165,8 +165,8 @@ class ToolCallAgent(ReActAgent):
 
         return "\n\n".join(results)
 
-    async def execute_tool(self, command: ToolCall) -> str:
-        """Execute a single tool call with robust error handling"""
+    async def execute_tool(self, command: ToolCall) -> Union[str, Dict]:
+        """Execute a single tool call with robust error handling, potentially returning a structured dict."""
         if not command or not command.function or not command.function.name:
             return "Error: Invalid command format"
 
@@ -175,28 +175,29 @@ class ToolCallAgent(ReActAgent):
             return f"Error: Unknown tool '{name}'"
 
         try:
-            # Parse arguments
             args = json.loads(command.function.arguments or "{}")
-
-            # Execute the tool
             logger.info(f"🔧 Activating tool: '{name}'...")
+            # Execute the tool - this might return str, ToolResult, or our ExecuteResult dict
             result = await self.available_tools.execute(name=name, tool_input=args)
 
-            # Handle special tools
             await self._handle_special_tool(name=name, result=result)
 
-            # If we got here, the tool executed successfully (or returned a ToolResult)
-            # Let's assume result is now potentially a ToolResult object
+            # --- Handle potential dictionary result from tool ---
+            if isinstance(result, dict) and 'output' in result and 'file_event' in result:
+                # If tool returned our specific dict, return it directly
+                return result
+            # --- End dictionary handling ---
 
-            # Check if result is a ToolResult with base64_image
-            if isinstance(result, ToolResult) and result.base64_image:
-                # Store the base64_image for later use in tool_message
-                self._current_base64_image = result.base64_image
-                # Format result for display
+            # --- Standard processing for str or ToolResult ---
+            observation = ""
+            if isinstance(result, ToolResult):
+                if result.base64_image:
+                    self._current_base64_image = result.base64_image
+                # Format result for display using the output field
                 observation = (
                     f"Observed output of cmd `{name}` executed:\n{str(result.output)}"
-                    if result.output
-                    else f"Cmd `{name}` completed with no output"
+                    if result.output is not None # Check if output exists
+                    else f"Cmd `{name}` completed with no output (ToolResult)"
                 )
             else:
                 # Format result for display (standard case, convert result to string)
@@ -206,7 +207,8 @@ class ToolCallAgent(ReActAgent):
                     else f"Cmd `{name}` completed with no output"
                 )
 
-            return observation
+            return observation # Return the formatted string observation
+
         except json.JSONDecodeError:
             error_msg = f"Error parsing arguments for {name}: Invalid JSON format"
             logger.error(

@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, DefaultDict, List, Literal, Optional, get_args
+from typing import Any, DefaultDict, List, Literal, Optional, get_args, Dict, TypedDict
 
 from app.config import config
 from app.exceptions import ToolError
@@ -14,6 +14,17 @@ from app.tool.file_operators import (
     PathLike,
     SandboxFileOperator,
 )
+
+# Define types for the file event structure
+class FileEvent(TypedDict):
+    type: Literal["file_opened", "file_updated"]
+    filename: str
+    content: str
+
+# Define the return type for the execute method
+class ExecuteResult(TypedDict):
+    output: str
+    file_event: Optional[FileEvent]
 
 
 Command = Literal[
@@ -122,46 +133,94 @@ class StrReplaceEditor(BaseTool):
         new_str: str | None = None,
         insert_line: int | None = None,
         **kwargs: Any,
-    ) -> str:
-        """Execute a file operation command."""
-        # Get the appropriate file operator
+    ) -> ExecuteResult:
+        """Execute a file operation command and return structured result."""
         operator = self._get_operator()
+        file_event: Optional[FileEvent] = None
+        result_output: str = ""
+        file_content_after_op: Optional[str] = None
 
-        # Validate path and command combination
         await self.validate_path(command, Path(path), operator)
 
-        # Execute the appropriate command
-        if command == "view":
-            result = await self.view(path, view_range, operator)
-        elif command == "create":
-            if file_text is None:
-                raise ToolError("Parameter `file_text` is required for command: create")
-            await operator.write_file(path, file_text)
-            self._file_history[path].append(file_text)
-            result = ToolResult(output=f"File created successfully at: {path}")
-        elif command == "str_replace":
-            if old_str is None:
-                raise ToolError(
-                    "Parameter `old_str` is required for command: str_replace"
-                )
-            result = await self.str_replace(path, old_str, new_str, operator)
-        elif command == "insert":
-            if insert_line is None:
-                raise ToolError(
-                    "Parameter `insert_line` is required for command: insert"
-                )
-            if new_str is None:
-                raise ToolError("Parameter `new_str` is required for command: insert")
-            result = await self.insert(path, insert_line, new_str, operator)
-        elif command == "undo_edit":
-            result = await self.undo_edit(path, operator)
-        else:
-            # This should be caught by type checking, but we include it for safety
-            raise ToolError(
-                f'Unrecognized command {command}. The allowed commands for the {self.name} tool are: {", ".join(get_args(Command))}'
-            )
+        try:
+            if command == "view":
+                # Determine if path is a directory before calling specific view methods
+                is_dir = await operator.is_directory(path)
+                if is_dir:
+                    view_result = await self._view_directory(path, operator)
+                    result_output = str(view_result)
+                    # No file_event for directory view
+                else:
+                    # Read full content regardless of view_range for the event
+                    file_content_after_op = await operator.read_file(path)
+                    # Get the formatted output string (potentially truncated)
+                    view_result = await self._view_file(path, operator, view_range, file_content_after_op)
+                    result_output = str(view_result)
+                    # Prepare file_event with full content
+                    file_event = {
+                        "type": "file_opened",
+                        "filename": path,
+                        "content": file_content_after_op
+                    }
 
-        return str(result)
+            elif command == "create":
+                if file_text is None:
+                    raise ToolError("Parameter `file_text` is required for command: create")
+                await operator.write_file(path, file_text)
+                self._file_history[path].append(file_text)
+                result_output = f"File created successfully at: {path}"
+                file_content_after_op = file_text
+                file_event = {
+                    "type": "file_opened",
+                    "filename": path,
+                    "content": file_content_after_op
+                }
+
+            elif command == "str_replace":
+                if old_str is None:
+                    raise ToolError("Parameter `old_str` is required for command: str_replace")
+                replace_result = await self.str_replace(path, old_str, new_str, operator)
+                result_output = str(replace_result)
+                file_content_after_op = await operator.read_file(path)
+                file_event = {
+                    "type": "file_updated",
+                    "filename": path,
+                    "content": file_content_after_op
+                }
+
+            elif command == "insert":
+                if insert_line is None:
+                    raise ToolError("Parameter `insert_line` is required for command: insert")
+                if new_str is None:
+                    raise ToolError("Parameter `new_str` is required for command: insert")
+                insert_result = await self.insert(path, insert_line, new_str, operator)
+                result_output = str(insert_result)
+                file_content_after_op = await operator.read_file(path)
+                file_event = {
+                    "type": "file_updated",
+                    "filename": path,
+                    "content": file_content_after_op
+                }
+
+            elif command == "undo_edit":
+                undo_result = await self.undo_edit(path, operator)
+                result_output = str(undo_result)
+                file_content_after_op = await operator.read_file(path)
+                file_event = {
+                    "type": "file_updated",
+                    "filename": path,
+                    "content": file_content_after_op
+                }
+            else:
+                # Should not happen with Literal type hint, but for safety
+                raise ToolError(f'Unrecognized command {command}.')
+
+        except Exception as e:
+             # Ensure errors still return the standard dictionary format
+             result_output = f"Error executing command '{command}' on '{path}': {str(e)}"
+             file_event = None # No file event on error
+
+        return {"output": result_output, "file_event": file_event}
 
     async def validate_path(
         self, command: str, path: Path, operator: FileOperator
@@ -236,58 +295,57 @@ class StrReplaceEditor(BaseTool):
         path: PathLike,
         operator: FileOperator,
         view_range: Optional[List[int]] = None,
+        file_content: Optional[str] = None,
     ) -> CLIResult:
         """Display file content, optionally within a specified line range."""
-        # Read file content
-        file_content = await operator.read_file(path)
+        if file_content is None:
+            file_content = await operator.read_file(path)
+
+        lines = file_content.split("\n")
+        total_lines = len(lines)
         init_line = 1
 
-        # Apply view range if specified
         if view_range:
             if len(view_range) != 2 or not all(isinstance(i, int) for i in view_range):
                 raise ToolError(
                     "Invalid `view_range`. It should be a list of two integers."
                 )
+            start, end = view_range
+            if start < 1 or (end != -1 and end < start):
+                raise ToolError("Invalid line numbers in `view_range`.")
 
-            file_lines = file_content.split("\n")
-            n_lines_file = len(file_lines)
-            init_line, final_line = view_range
+            start_index = start - 1
+            end_index = end if end != -1 else total_lines
 
-            # Validate view range
-            if init_line < 1 or init_line > n_lines_file:
-                raise ToolError(
-                    f"Invalid `view_range`: {view_range}. Its first element `{init_line}` should be "
-                    f"within the range of lines of the file: {[1, n_lines_file]}"
-                )
-            if final_line > n_lines_file:
-                raise ToolError(
-                    f"Invalid `view_range`: {view_range}. Its second element `{final_line}` should be "
-                    f"smaller than the number of lines in the file: `{n_lines_file}`"
-                )
-            if final_line != -1 and final_line < init_line:
-                raise ToolError(
-                    f"Invalid `view_range`: {view_range}. Its second element `{final_line}` should be "
-                    f"larger or equal than its first `{init_line}`"
-                )
+            if start_index >= total_lines:
+                return CLIResult(output=f"File {path} has only {total_lines} lines. Cannot display starting from line {start}.")
 
-            # Apply range
-            if final_line == -1:
-                file_content = "\n".join(file_lines[init_line - 1 :])
-            else:
-                file_content = "\n".join(file_lines[init_line - 1 : final_line])
+            lines_to_show = lines[start_index:end_index]
+            init_line = start
+        else:
+            lines_to_show = lines
 
-        # Format and return result
-        return CLIResult(
-            output=self._make_output(file_content, str(path), init_line=init_line)
-        )
+        # Format output with line numbers
+        formatted_lines = [
+            f"{i+init_line: >4}\t{line}" for i, line in enumerate(lines_to_show)
+        ]
+        # Use maybe_truncate on the JOINED string, not individual lines
+        output_content = maybe_truncate("\n".join(formatted_lines))
+
+        stdout = (
+             f"Here's the result of running `cat -n` on {path}"
+             f"{f' in range {view_range}' if view_range else ''}:\n{output_content}\n"
+         )
+
+        return CLIResult(output=stdout)
 
     async def str_replace(
         self,
         path: PathLike,
         old_str: str,
-        new_str: Optional[str] = None,
-        operator: FileOperator = None,
-    ) -> CLIResult:
+        new_str: Optional[str],
+        operator: FileOperator,
+    ) -> ToolResult:
         """Replace a unique string in a file with a new string."""
         # Read file content and expand tabs
         file_content = (await operator.read_file(path)).expandtabs()
@@ -335,15 +393,15 @@ class StrReplaceEditor(BaseTool):
         )
         success_msg += "Review the changes and make sure they are as expected. Edit the file again if necessary."
 
-        return CLIResult(output=success_msg)
+        return ToolResult(output=success_msg)
 
     async def insert(
         self,
         path: PathLike,
         insert_line: int,
         new_str: str,
-        operator: FileOperator = None,
-    ) -> CLIResult:
+        operator: FileOperator,
+    ) -> ToolResult:
         """Insert text at a specific line in a file."""
         # Read and prepare content
         file_text = (await operator.read_file(path)).expandtabs()
@@ -389,11 +447,11 @@ class StrReplaceEditor(BaseTool):
         )
         success_msg += "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary."
 
-        return CLIResult(output=success_msg)
+        return ToolResult(output=success_msg)
 
     async def undo_edit(
-        self, path: PathLike, operator: FileOperator = None
-    ) -> CLIResult:
+        self, path: PathLike, operator: FileOperator
+    ) -> ToolResult:
         """Revert the last edit made to a file."""
         if not self._file_history[path]:
             raise ToolError(f"No edit history found for {path}.")
@@ -401,7 +459,7 @@ class StrReplaceEditor(BaseTool):
         old_text = self._file_history[path].pop()
         await operator.write_file(path, old_text)
 
-        return CLIResult(
+        return ToolResult(
             output=f"Last edit to {path} undone successfully. {self._make_output(old_text, str(path))}"
         )
 

@@ -15,6 +15,7 @@ from app.tool.base import BaseTool, ToolResult
 from app.tool.ask_human import HumanInterventionRequired
 
 
+
 class WebSocketManus(Manus):
     """
     A Manus subclass that adds WebSocket updates for frontend integration.
@@ -89,22 +90,47 @@ class WebSocketManus(Manus):
             raise # Re-raise the exception
 
     # Example: Override execute_tool method
-    async def execute_tool(self, tool_call: ToolCall) -> ToolResult:
-        """Override tool execution to add updates before and after."""
+    async def execute_tool(self, tool_call: ToolCall) -> Optional[str]:
+        """Override tool execution to add updates before and after, and handle file events."""
         tool_name = tool_call.function.name
         args_str = str(tool_call.function.arguments)
         await self.send_update({
             "type": "tool_call",
             "agent": self.name,
             "tool_name": tool_name,
-            "arguments": args_str[:200] + ('...' if len(args_str) > 200 else ''),
+            "arguments": args_str,
             "text": f"Executing tool: {tool_name}..."
         })
         try:
-            # Call the original execution logic
             tool_result_raw = await super().execute_tool(tool_call)
 
-            # Prepare update data, handling different result types
+            # --- Handle File Event ---
+            file_event_to_send = None
+            output_for_processing = None # This will hold the STRING output
+
+            if isinstance(tool_result_raw, dict):
+                file_event_data = tool_result_raw.get('file_event')
+                output_for_processing = tool_result_raw.get('output', '')
+
+                if file_event_data:
+                    file_event_to_send = file_event_data
+                    logger.info(f"[WSManus.execute_tool] Extracted file_event: {file_event_to_send.get('type')}, file: {file_event_to_send.get('filename')}")
+                else:
+                    logger.debug("[WSManus.execute_tool] file_event key exists but value is None/empty.")
+            else:
+                output_for_processing = tool_result_raw
+
+            # Send the specific file event update if it exists
+            if file_event_to_send:
+                if 'type' in file_event_to_send:
+                     await self.send_update(file_event_to_send)
+                else:
+                     logger.warning("[WSManus.execute_tool] File event data missing 'type', not sending.")
+            else:
+                 logger.debug("[WSManus.execute_tool] No file_event_to_send.")
+            # --- End Handle File Event ---
+
+            # Prepare standard tool_result update data using output_for_processing (should be string now)
             update_payload = {
                 "type": "tool_result",
                 "agent": self.name,
@@ -113,50 +139,39 @@ class WebSocketManus(Manus):
                 "output_summary": "",
                 "text": f"Tool {tool_name} finished."
             }
-
-            # Check if the result is a ToolResult object
-            if isinstance(tool_result_raw, ToolResult):
-                output_summary = str(tool_result_raw.output)[:200] + ('...' if len(str(tool_result_raw.output)) > 200 else '')
-                update_payload["status"] = tool_result_raw.status
-                update_payload["output_summary"] = output_summary
-                update_payload["text"] = f"Tool {tool_name} finished with status: {tool_result_raw.status}."
-                tool_result_to_return = tool_result_raw # Return the original object
-            # Check if the result is just a string
-            elif isinstance(tool_result_raw, str):
-                output_summary = tool_result_raw[:200] + ('...' if len(tool_result_raw) > 200 else '')
-                update_payload["status"] = "completed" # Assume completed if string is returned
-                update_payload["output_summary"] = output_summary
-                update_payload["text"] = f"Tool {tool_name} finished. Result: {output_summary}"
-                # We need to return a ToolResult for type consistency,
-                # or change the signature? Let's create a minimal one.
-                tool_result_to_return = ToolResult(status="completed", output=tool_result_raw, error=None)
-            # Handle other unexpected types
+            tool_status = "unknown"
+            output_summary_text = ""
+            return_value_for_agent = None
+            if isinstance(output_for_processing, ToolResult):
+                logger.warning("[WSManus.execute_tool] output_for_processing is unexpectedly a ToolResult object.")
+                output_summary_text = str(output_for_processing.output)[:200] + ('...' if len(str(output_for_processing.output)) > 200 else '')
+                tool_status = output_for_processing.status
+                return_value_for_agent = output_for_processing.output # Extract string
+            elif isinstance(output_for_processing, str):
+                output_summary_text = output_for_processing[:200] + ('...' if len(output_for_processing) > 200 else '')
+                tool_status = "completed"
+                return_value_for_agent = output_for_processing
             else:
-                output_summary = str(tool_result_raw)[:200] + ('...' if len(str(tool_result_raw)) > 200 else '')
-                update_payload["output_summary"] = output_summary
-                update_payload["text"] = f"Tool {tool_name} finished with unexpected result type: {type(tool_result_raw).__name__}."
-                logger.warning(f"Tool {tool_name} returned unexpected type: {type(tool_result_raw)}")
-                # Return a ToolResult indicating the issue
-                tool_result_to_return = ToolResult(status="error", output=f"Unexpected result type: {type(tool_result_raw).__name__}", error=f"Unexpected result type: {type(tool_result_raw)}")
+                # Handle other types (None, etc.)
+                output_summary_text = str(output_for_processing)[:200] + ('...' if len(str(output_for_processing)) > 200 else '')
+                tool_status = "error"
+                logger.warning(f"[WSManus.execute_tool] output_for_processing was unexpected type: {type(output_for_processing)}")
+                return_value_for_agent = f"Error: Tool returned unusable data type: {type(output_for_processing).__name__}"
 
-            # Send the update
+            # Update payload
+            update_payload["status"] = tool_status
+            update_payload["output_summary"] = output_summary_text
+            update_payload["text"] = f"Tool {tool_name} finished with status: {tool_status}. Result: {output_summary_text}"
+
+            # Send the standard tool_result update
             await self.send_update(update_payload)
 
-            # Return a ToolResult object consistently
-            # return tool_result_to_return # <<< OLD RETURN
-
-            # --- NEW RETURN ---
-            # Return only the output, which is likely what the original step logic expects.
-            # Ensure we handle cases where output might be None or not string.
-            output_to_return = getattr(tool_result_to_return, 'output', None)
-            logger.debug(f"execute_tool override returning output: {str(output_to_return)[:100]}...")
-            # The original execute_tool likely returned the output string directly or None
-            return output_to_return
+            # Return the STRING value expected by the agent's core logic
+            return return_value_for_agent if return_value_for_agent is not None else ""
 
         except HumanInterventionRequired as hir:
-             logger.info(f"HumanInterventionRequired during execute_tool ({tool_name})")
-             # No specific update needed here, the Flow override handles it
-             raise hir # Re-raise for the Flow/caller to handle
+            logger.info(f"HumanInterventionRequired during execute_tool ({tool_name})")
+            raise hir
         except Exception as e:
             logger.error(f"Error during execute_tool override ({tool_name}): {e}", exc_info=True)
             await self.send_update({
@@ -164,8 +179,8 @@ class WebSocketManus(Manus):
                 "agent": self.name,
                 "text": f"Error executing tool {tool_name}: {e}",
                 "tool_name": tool_name
-             })
-            raise
+            })
+            raise # Re-raise for the flow/caller to handle
 
     # NOTE: We might need to override more methods from Manus depending on its structure
     # For example, the main `step` method or specific processing methods within it.
@@ -189,3 +204,45 @@ class WebSocketManus(Manus):
             logger.error(f"Error during WebSocketManus step override: {e}", exc_info=True)
             await self.send_update({"type": "error", "agent": self.name, "text": f"Error processing agent step: {e}"})
             raise # Re-raise exception to be handled by the run loop
+
+    # --- Override think method to send llm_response ---
+    async def think(self) -> bool:
+        """Override think to send llm_response update after super().think()."""
+        thinking_result = await super().think()
+        if thinking_result:
+            last_assistant_message = next((msg for msg in reversed(self.memory.messages) if msg.role == "assistant"), None)
+            if last_assistant_message:
+                content = last_assistant_message.content
+                tool_calls = last_assistant_message.tool_calls
+
+                # --- Convert ToolCall objects to JSON-serializable format ---
+                serializable_tool_calls = None
+                if tool_calls:
+                    try:
+                        # Assuming Pydantic v2+ .model_dump(), use mode='json' for best results
+                        serializable_tool_calls = [tc.model_dump(mode='json') for tc in tool_calls]
+                    except AttributeError:
+                        # Fallback for older Pydantic or other objects: try .dict()
+                        try:
+                            serializable_tool_calls = [tc.dict() for tc in tool_calls]
+                        except Exception as e:
+                             logger.error(f"Failed to serialize tool calls for WebSocket: {e}", exc_info=True)
+                             serializable_tool_calls = [{"error": "Serialization failed"}] # Send placeholder
+                    except Exception as e:
+                         logger.error(f"Failed to serialize tool calls using model_dump: {e}", exc_info=True)
+                         serializable_tool_calls = [{"error": "Serialization failed"}] # Send placeholder
+                # --- End Conversion ---
+
+                logger.debug(f"[WSManus.think] Sending llm_response update. Content: '{str(content)[:50]}...', ToolCalls: {len(serializable_tool_calls) if serializable_tool_calls else 0}")
+                await self.send_update({
+                    "type": "llm_response",
+                    "agent": self.name,
+                    "text": "Received response from LLM.",
+                    "content": content,
+                    # Use the serializable list here
+                    "tool_calls": serializable_tool_calls
+                })
+            else:
+                logger.warning("[WSManus.think] thinking_result was True, but couldn't find last assistant message in memory.")
+        return thinking_result
+    # --- End Override think ---
