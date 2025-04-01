@@ -1,7 +1,12 @@
 import asyncio
 import json
 import uuid # For unique tool call IDs if needed by frontend
-from typing import Dict, Any
+import os # <-- Import os module
+from pathlib import Path # <-- Import Path
+from typing import Dict, Any, List, Optional # <-- Add List, Optional
+
+import aiofiles # <-- Import aiofiles for async file writing
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from loguru import logger
 
@@ -15,7 +20,15 @@ from app.flow.websocket_planning import WebSocketPlanningFlow
 from app.tool.planning import PlanningTool
 from app.tool.ask_human import HumanInterventionRequired # Import for type checking
 
+# Import config to get workspace path
+from app.config import config
+
 app = FastAPI()
+
+# Define FileData type matching frontend
+class FileData(Dict[str, Any]):
+    name: str
+    content: str
 
 # Store active connections and their associated state
 class ConnectionState:
@@ -48,6 +61,38 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # Consider cleaning up connection here if send fails repeatedly
         else:
              logger.warning(f"Attempted to send update to closed/invalid websocket for {client_id}")
+
+    # --- Function to save files (New) ---
+    async def save_uploaded_files(files: List[FileData], target_dir: Path):
+        saved_files = []
+        if not files:
+            return saved_files
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"[{client_id}] Saving {len(files)} files to {target_dir}")
+
+        for file_data in files:
+            # Basic sanitization: remove path separators from filename
+            sanitized_name = os.path.basename(file_data.get("name", "unnamed_file"))
+            if not sanitized_name:
+                sanitized_name = "unnamed_file"
+
+            target_path = target_dir / sanitized_name
+            content = file_data.get("content", "")
+
+            try:
+                async with aiofiles.open(target_path, mode='w', encoding='utf-8') as f:
+                    await f.write(content)
+                logger.info(f"[{client_id}] Saved file: {target_path}")
+                saved_files.append(str(target_path))
+                # Optionally send update to client about saved file
+                # await send_update({"type": "status_frontend", "text": f"Received and saved file: {sanitized_name}"})
+            except Exception as e:
+                logger.error(f"[{client_id}] Failed to save file '{sanitized_name}' to {target_path}: {e}")
+                # Optionally send error update to client
+                # await send_update({"type": "error_frontend", "text": f"Failed to save file: {sanitized_name}"})
+
+        return saved_files
 
     # --- Main execution function (runs in background) ---
     async def run_agent_flow(prompt: str, conn_state: ConnectionState):
@@ -114,11 +159,21 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 data = json.loads(message_text)
                 msg_type = data.get("type")
 
-                # --- Handle Initial Prompt ---
+                # --- Handle Initial Prompt (Modified) ---
                 if "prompt" in data and not connection_state.flow_task:
                     prompt = data.get("prompt")
+                    files: List[FileData] = data.get("files", []) # <-- Get files list
+
                     if prompt and prompt.strip():
                         logger.info(f"[{client_id}] Received prompt: '{prompt}'")
+                        if files:
+                            logger.info(f"[{client_id}] Received {len(files)} files with prompt.")
+                            # Define where to save files (e.g., in workspace/uploads/client_id)
+                            upload_dir = Path(config.workspace_root) / "uploads" / client_id
+                            saved_file_paths = await save_uploaded_files(files, upload_dir)
+                            # You could potentially add info about saved files to the prompt
+                            # prompt += f"\n\n(User uploaded {len(saved_file_paths)} files to {upload_dir}: {', '.join(os.path.basename(p) for p in saved_file_paths)})"
+
                         await send_update({"type": "status", "text": f"Received prompt. Starting agent..."})
                         # Start execution in a background task
                         connection_state.flow_task = asyncio.create_task(
