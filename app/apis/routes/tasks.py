@@ -273,108 +273,99 @@ async def continue_agent_execution(agent, task_id):
     try:
         logger.info(f"Continuing agent execution for task {task_id} after human response")
 
-        # На этом этапе ответ пользователя уже добавлен в память агента
-        # Теперь нам нужно запустить полный цикл выполнения агента
-
-        # Максимальное количество шагов для защиты от бесконечного цикла
-        max_steps = agent.max_steps - agent.current_step
-        if max_steps <= 0:
-            max_steps = 20  # Резервное значение, если счетчик шагов уже достиг максимума
-
-        logger.info(f"Starting full execution cycle with up to {max_steps} remaining steps")
-
-        # Сохраняем текущее состояние агента
+        # Сохраняем текущее состояние и шаг
         original_state = agent.state
+        remaining_steps = agent.max_steps - agent.current_step
 
-        # Переводим агента в состояние RUNNING, если он не находится в нём
-        if agent.state != AgentState.RUNNING:
-            agent.state = AgentState.RUNNING
+        # Если у нас осталось слишком мало шагов, увеличим лимит
+        if remaining_steps < 3:
+            logger.warning(f"Too few steps remaining ({remaining_steps}), extending max_steps")
+            agent.max_steps += 10
+            remaining_steps = agent.max_steps - agent.current_step
 
-        # Выполняем цикл шагов, моделируя метод run()
-        steps_executed = 0
+        logger.info(f"Continuing execution with up to {remaining_steps} remaining steps")
 
-        while steps_executed < max_steps and agent.state != AgentState.FINISHED:
-            try:
+        # Выполняем цикл, используя тот же паттерн, что и метод run()
+        results = []
+
+        # Переводим агента в состояние RUNNING с помощью контекстного менеджера
+        async with agent.state_context(AgentState.RUNNING):
+            while (agent.current_step < agent.max_steps and
+                   agent.state != AgentState.FINISHED):
+                # Увеличиваем счетчик шагов
                 agent.current_step += 1
-                steps_executed += 1
 
-                logger.info(f"Executing step {agent.current_step}/{agent.max_steps} for task {task_id}")
+                # Выполняем очередной шаг
+                logger.info(f"Executing continuation step {agent.current_step}/{agent.max_steps}")
+                try:
+                    step_result = await agent.step()
+                    logger.info(f"Step completed with result: {step_result[:50]}..." if len(str(step_result)) > 50 else step_result)
 
-                # Выполняем полный шаг (think + act)
-                think_result = await agent.think()
-
-                if think_result:
-                    action_result = await agent.act()
-                    logger.info(f"Action executed with result length: {len(str(action_result))}")
-                else:
-                    logger.info("Agent decided not to take action")
-                    break
-
-                # Проверяем, застрял ли агент в цикле
-                if hasattr(agent, "is_stuck") and agent.is_stuck():
-                    if hasattr(agent, "handle_stuck_state"):
+                    # Проверяем, не застрял ли агент
+                    if agent.is_stuck():
                         agent.handle_stuck_state()
 
-                # Небольшая пауза между шагами
-                await asyncio.sleep(0.1)
+                    results.append(f"Step {agent.current_step}: {step_result}")
 
-            except HumanInterventionRequired as hir:
-                # Если агент снова запросил вмешательство пользователя
-                logger.info(f"Agent requested human input again: {hir.question}")
-                logger.info(f"Waiting for response to ask_human with interaction_id: {hir.tool_call_id}")
+                except HumanInterventionRequired as hir:
+                    # Обработка запроса на взаимодействие с пользователем
+                    logger.info(f"Agent requested human input: {hir.question}")
 
-                # Добавляем прерванное сообщение инструмента, как в оригинальной системе
-                interrupted_tool_content = f"Tool execution interrupted to ask user: {hir.question}"
-                agent.update_memory(
-                    role="tool",
-                    content=interrupted_tool_content,
-                    tool_call_id=hir.tool_call_id,
-                    name="ask_human"
-                )
+                    # Добавляем прерванное сообщение инструмента
+                    interrupted_tool_content = f"Tool execution interrupted to ask user: {hir.question}"
+                    agent.update_memory(
+                        role="tool",
+                        content=interrupted_tool_content,
+                        tool_call_id=hir.tool_call_id,
+                        name="ask_human"
+                    )
 
-                # Создадим событие, чтобы фронтенд знал о запросе
+                    # Отправляем событие интерфейсу
+                    if hasattr(agent, "emit"):
+                        agent.emit(
+                            "agent:tool:ask_human",
+                            agent.current_step,
+                            query=hir.question,
+                            interaction_id=hir.tool_call_id
+                        )
+                    # Выходим из цикла, чтобы дождаться ответа пользователя
+                    break
+
+                except Exception as e:
+                    error_msg = f"Error in step {agent.current_step}: {str(e)}"
+                    logger.error(error_msg)
+                    results.append(f"Step {agent.current_step}: {error_msg}")
+
+            # Проверяем, достигнут ли максимум шагов
+            if agent.current_step >= agent.max_steps:
+                logger.warning(f"Reached maximum steps ({agent.max_steps})")
+                agent.state = AgentState.IDLE  # Сброс состояния, как в BaseAgent.run()
                 if hasattr(agent, "emit"):
                     agent.emit(
-                        "agent:tool:ask_human",
+                        "agent:lifecycle:complete",
                         agent.current_step,
-                        query=hir.question,
-                        interaction_id=hir.tool_call_id
+                        result="Task completed: reached maximum steps"
                     )
-                # Выходим из цикла - будем ждать нового ответа пользователя
-                break
 
-            except Exception as e:
-                logger.error(f"Error in step {agent.current_step}: {str(e)}")
-                # Продолжаем выполнение следующего шага после ошибки
-                continue
-
-        # Проверяем, был ли достигнут лимит шагов
-        if steps_executed >= max_steps and agent.state != AgentState.FINISHED:
-            logger.warning(f"Reached maximum steps ({max_steps}) for task continuation")
-
-            # Отправляем событие о завершении по тайм-ауту
-            if hasattr(agent, "emit"):
-                agent.emit(
-                    "agent:lifecycle:complete",
-                    agent.current_step,
-                    result="Task completed: reached maximum execution steps"
-                )
-
-        # Если выполнение завершено явно, отправляем событие о завершении
-        if agent.state == AgentState.FINISHED:
-            if hasattr(agent, "emit"):
-                agent.emit(
-                    "agent:lifecycle:complete",
-                    agent.current_step,
-                    result="Task completed successfully"
-                )
+        # Если агент завершил задачу, отправляем событие о завершении
+        if agent.state == AgentState.FINISHED and hasattr(agent, "emit"):
+            agent.emit(
+                "agent:lifecycle:complete",
+                agent.current_step,
+                result="Task completed successfully"
+            )
 
         # Убедимся, что все события обработаны
         queue = task_manager.queues[task_id]
+        await asyncio.sleep(0.1)  # Небольшая пауза для обработки событий
         while not queue.empty():
             await asyncio.sleep(0.1)
 
+        # Возвращаем агента в исходное состояние, если выполнение не было завершено
+        if agent.state != AgentState.FINISHED and agent.state != original_state:
+            agent.state = original_state
+
     except Exception as e:
-        logger.error(f"Error in continue_agent_execution for task {task_id}: {str(e)}")
+        logger.error(f"Error in continue_agent_execution for {task_id}: {str(e)}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
