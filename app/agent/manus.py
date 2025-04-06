@@ -16,6 +16,17 @@ from app.tool.ask_human import AskHuman
 class Manus(ToolCallAgent):
     """A versatile general-purpose agent."""
 
+    class Events:
+        MESSAGE = "agent:message"
+        THINKING = "agent:thinking"
+        TOOL_START = "agent:tool:start"
+        TOOL_COMPLETE = "agent:tool:complete"
+        TOOL_ERROR = "agent:tool:error"
+        TOOL_ASK_HUMAN = "agent:tool:ask_human"
+        LIFECYCLE_START = "agent:lifecycle:start"
+        LIFECYCLE_COMPLETE = "agent:lifecycle:complete"
+        LIFECYCLE_ERROR = "agent:lifecycle:error"
+
     name: str = "Manus"
     description: str = (
         "A versatile agent that can solve various tasks using multiple tools"
@@ -41,6 +52,7 @@ class Manus(ToolCallAgent):
     special_tool_names: list[str] = Field(default_factory=lambda: [Terminate().name])
 
     browser_context_helper: Optional[BrowserContextHelper] = None
+    task_id: Optional[str] = None  # Добавляем поле для task_id, используемого в API
 
     @model_validator(mode="after")
     def initialize_helper(self) -> "Manus":

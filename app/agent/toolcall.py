@@ -71,6 +71,9 @@ class ToolCallAgent(ReActAgent):
                     )
                 )
                 self.state = AgentState.FINISHED
+                # Emit error event if supported by agent
+                if hasattr(self, "emit"):
+                    self.emit("agent:lifecycle:error", self.current_step, error=str(token_limit_error))
                 return False
             raise
 
@@ -90,6 +93,10 @@ class ToolCallAgent(ReActAgent):
             )
             logger.info(f"🔧 Tool arguments: {tool_calls[0].function.arguments}")
 
+        # Emit thinking event if supported by agent
+        if hasattr(self, "emit"):
+            self.emit("agent:thinking", self.current_step, content=content)
+
         try:
             if response is None:
                 raise RuntimeError("No response received from the LLM")
@@ -102,6 +109,9 @@ class ToolCallAgent(ReActAgent):
                     )
                 if content:
                     self.memory.add_message(Message.assistant_message(content))
+                    # Emit message event if supported by agent
+                    if hasattr(self, "emit"):
+                        self.emit("agent:message", self.current_step, content=content, role="assistant")
                     return True
                 return False
 
@@ -112,6 +122,10 @@ class ToolCallAgent(ReActAgent):
                 else Message.assistant_message(content)
             )
             self.memory.add_message(assistant_msg)
+
+            # Emit message event if supported by agent
+            if hasattr(self, "emit") and content:
+                self.emit("agent:message", self.current_step, content=content, role="assistant")
 
             if self.tool_choices == ToolChoice.REQUIRED and not self.tool_calls:
                 return True  # Will be handled in act()
@@ -144,7 +158,34 @@ class ToolCallAgent(ReActAgent):
             # Reset base64_image for each tool call
             self._current_base64_image = None
 
-            result = await self.execute_tool(command)
+            # Emit tool start event if supported by agent
+            if hasattr(self, "emit"):
+                self.emit("agent:tool:start", self.current_step,
+                          tool_name=command.function.name,
+                          arguments=command.function.arguments)
+
+            try:
+                result = await self.execute_tool(command)
+
+                # Emit tool complete event if supported by agent
+                if hasattr(self, "emit"):
+                    self.emit("agent:tool:complete", self.current_step,
+                              tool_name=command.function.name,
+                              result=result)
+            except HumanInterventionRequired as hir:
+                # Emit ask_human event if supported by agent
+                if hasattr(self, "emit"):
+                    self.emit("agent:tool:ask_human", self.current_step,
+                              query=hir.question,
+                              interaction_id=hir.tool_call_id)
+                raise
+            except Exception as e:
+                # Emit tool error event if supported by agent
+                if hasattr(self, "emit"):
+                    self.emit("agent:tool:error", self.current_step,
+                              tool_name=command.function.name,
+                              error=str(e))
+                result = f"Error executing tool {command.function.name}: {str(e)}"
 
             if self.max_observe:
                 result = result[: self.max_observe]
@@ -258,7 +299,22 @@ class ToolCallAgent(ReActAgent):
 
     async def run(self, request: Optional[str] = None) -> str:
         """Run the agent with cleanup when done."""
+        # Emit lifecycle start event if supported by agent
+        if hasattr(self, "emit"):
+            self.emit("agent:lifecycle:start", 0, request=request)
+
         try:
-            return await super().run(request)
+            result = await super().run(request)
+
+            # Emit lifecycle complete event if supported by agent
+            if hasattr(self, "emit"):
+                self.emit("agent:lifecycle:complete", self.current_step, result=result)
+
+            return result
+        except Exception as e:
+            # Emit lifecycle error event if supported by agent
+            if hasattr(self, "emit"):
+                self.emit("agent:lifecycle:error", self.current_step, error=str(e))
+            raise
         finally:
             await self.cleanup()

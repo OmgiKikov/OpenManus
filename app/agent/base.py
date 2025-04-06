@@ -111,7 +111,12 @@ class BaseAgent(BaseModel, ABC):
 
         # Create message with appropriate parameters based on role
         kwargs = {"base64_image": base64_image, **(kwargs if role == "tool" else {})}
-        self.memory.add_message(message_map[role](content, **kwargs))
+
+        # Для системных сообщений не передаем base64_image
+        if role == "system":
+            self.memory.add_message(message_map[role](content))
+        else:
+            self.memory.add_message(message_map[role](content, **kwargs))
 
     async def run(self, request: Optional[str] = None) -> str:
         """Execute the agent's main loop asynchronously.
@@ -194,3 +199,48 @@ class BaseAgent(BaseModel, ABC):
     def messages(self, value: List[Message]):
         """Set the list of messages in the agent's memory."""
         self.memory.messages = value
+
+    def on(self, event_pattern: str, handler):
+        """Register an event handler for the specified event pattern.
+
+        Args:
+            event_pattern: Regular expression pattern to match event names
+            handler: Function to call when an event matching the pattern occurs
+        """
+        # Создаем атрибут _event_handlers, если его еще нет
+        if not hasattr(self, "_event_handlers"):
+            self._event_handlers = {}
+
+        if event_pattern not in self._event_handlers:
+            self._event_handlers[event_pattern] = []
+
+        self._event_handlers[event_pattern].append(handler)
+        logger.debug(f"Added event handler for pattern: {event_pattern}")
+
+    def emit(self, event_name: str, step: int, **kwargs):
+        """Emit an event to all registered handlers.
+
+        Args:
+            event_name: Name of the event
+            step: Current step number
+            **kwargs: Additional event parameters
+        """
+        if not hasattr(self, "_event_handlers"):
+            return
+
+        import re
+        for pattern, handlers in self._event_handlers.items():
+            if re.match(pattern, event_name):
+                for handler in handlers:
+                    try:
+                        # Проверяем, является ли обработчик корутиной
+                        import inspect
+                        if inspect.iscoroutinefunction(handler):
+                            # Если асинхронный обработчик, создаем задачу в цикле событий
+                            import asyncio
+                            asyncio.create_task(handler(event_name=event_name, step=step, **kwargs))
+                        else:
+                            # Для обычных функций вызываем синхронно
+                            handler(event_name=event_name, step=step, **kwargs)
+                    except Exception as e:
+                        logger.error(f"Error in event handler for {event_name}: {str(e)}")
