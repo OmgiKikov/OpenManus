@@ -1,25 +1,22 @@
 import asyncio
+import json
 from json import dumps
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional, Union, cast
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.agent.manus import Manus
+from app.agent.base import BaseAgentEvents
+from app.agent.manus import Manus, McpToolConfig
 from app.apis.services.task_manager import task_manager
-from app.config import LLMSettings
+from app.config import LLMSettings, config
 from app.llm import LLM
 from app.logger import logger
-from app.schema import AgentState
-from app.tool.ask_human import HumanInterventionRequired
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 AGENT_NAME = "Manus"
-
-# Определяем константу для сигнализации о взаимодействии с человеком
-# Это согласуется с тем, что используется в app/flow/planning.py
-HUMAN_INTERACTION_SIGNAL = "__HUMAN_INTERACTION_OCCURRED__"
 
 
 async def handle_agent_event(task_id: str, event_name: str, step: int, **kwargs):
@@ -39,7 +36,7 @@ async def handle_agent_event(task_id: str, event_name: str, step: int, **kwargs)
     )
 
 
-async def run_task(task_id: str, language: Optional[str] = None):
+async def run_task(task_id: str):
     """Run the task and set up corresponding event handlers.
 
     Args:
@@ -51,56 +48,22 @@ async def run_task(task_id: str, language: Optional[str] = None):
         task = task_manager.tasks[task_id]
         agent = task.agent
 
-        # Вместо вызова initialize, установим атрибуты напрямую, т.к. в классе Manus нет такого метода
-        if language:
-            # Если нужно установить язык, можно это сделать через атрибуты
-            agent.task_id = task_id
-        else:
-            agent.task_id = task_id
-
         # Set up event handlers based on all event types defined in the Agent class hierarchy
         event_patterns = [r"agent:.*"]
         # Register handlers for each event pattern
         for pattern in event_patterns:
-            # Создаем асинхронную вспомогательную функцию, чтобы корректно вызывать await
-            async def event_handler_wrapper(event_name, step, **kwargs):
-                await handle_agent_event(
+            agent.on(
+                pattern,
+                lambda event_name, step, **kwargs: handle_agent_event(
                     task_id=task_id,
                     event_name=event_name,
                     step=step,
-                    **kwargs,
-                )
-
-            agent.on(pattern, event_handler_wrapper)
-
-        try:
-            # Run the agent
-            await agent.run(task.prompt)
-        except HumanInterventionRequired as hir:
-            # Catch the exception raised by AskHuman (and re-raised by the agent)
-            logger.info(f"Agent requested human input for tool_call_id: {hir.tool_call_id}")
-            logger.info(f"Question: {hir.question}")
-
-            # Добавляем прерванное сообщение инструмента, как в оригинальной системе
-            interrupted_tool_content = f"Tool execution interrupted to ask user: {hir.question}"
-            agent.update_memory(
-                role="tool",
-                content=interrupted_tool_content,
-                tool_call_id=hir.tool_call_id,
-                name="ask_human"
+                    **{k: v for k, v in kwargs.items() if k != "task_id"},
+                ),
             )
-            logger.info(f"Added interrupted tool result message to agent memory for ID {hir.tool_call_id}.")
 
-            # Создадим событие, чтобы фронтенд знал о запросе
-            if hasattr(agent, "emit"):
-                agent.emit(
-                    "agent:tool:ask_human",
-                    agent.current_step,
-                    query=hir.question,
-                    interaction_id=hir.tool_call_id
-                )
-
-            # Задача будет продолжена, когда пользователь ответит через API endpoint
+        # Run the agent
+        await agent.run(task.prompt)
 
         # Ensure all events have been processed
         queue = task_manager.queues[task_id]
@@ -126,14 +89,8 @@ async def event_generator(task_id: str):
             # Send actual event data
             if event.get("type"):
                 yield f"data: {formatted_event}\n\n"
-
-                # Проверяем, закончилось ли выполнение задачи
-                if event.get("event_name") == Manus.Events.LIFECYCLE_COMPLETE:
-                    logger.info(f"Task {task_id} completed, closing event stream")
+                if event.get("event_name") == BaseAgentEvents.LIFECYCLE_COMPLETE:
                     break
-
-                # Выводим информацию о событии для отладки
-                logger.debug(f"Event sent to client: {event}")
 
             # Send heartbeat
             yield ":heartbeat\n\n"
@@ -145,15 +102,70 @@ async def event_generator(task_id: str):
             logger.error(f"Error in event stream: {str(e)}")
             yield f"event: error\ndata: {dumps({'message': str(e)})}\n\n"
             break
+    await task_manager.remove_task(task_id)
+
+
+def parse_tools(tools: list[str]) -> list[Union[str, McpToolConfig]]:
+    """Parse tools list which may contain both tool names and MCP configurations.
+
+    Args:
+        tools: List of tool strings, which can be either tool names or MCP config JSON strings
+
+    Returns:
+        List of processed tools, containing both tool names and McpToolConfig objects
+
+    Raises:
+        HTTPException: If any tool configuration is invalid
+    """
+    processed_tools = []
+    for tool in tools:
+        try:
+            tool_config = json.loads(tool)
+            if isinstance(tool_config, dict):
+                mcp_tool = McpToolConfig.model_validate(tool_config)
+                processed_tools.append(mcp_tool)
+            else:
+                processed_tools.append(tool)
+        except json.JSONDecodeError:
+            processed_tools.append(tool)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid tool configuration for '{tool}': {str(e)}",
+            )
+    return processed_tools
 
 
 @router.post("")
 async def create_task(
-    task_id: str = Body(..., embed=True),
-    prompt: str = Body(..., embed=True),
-    preferences: Optional[dict] = Body(None, embed=True),
-    llm_config: Optional[LLMSettings] = Body(None, embed=True),
+    task_id: str = Form(...),
+    prompt: str = Form(...),
+    tools: list[str] = Form(...),
+    preferences: Optional[str] = Form(None),
+    llm_config: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
 ):
+    # Parse preferences and llm_config from JSON strings
+    preferences_dict = None
+    if preferences:
+        try:
+            preferences_dict = json.loads(preferences)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400, detail="Invalid preferences JSON format"
+            )
+
+    llm_config_obj = None
+    if llm_config:
+        try:
+            llm_config_obj = LLMSettings.model_validate_json(llm_config)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid llm_config format: {str(e)}"
+            )
+
+    processed_tools = parse_tools(tools)
+
     task = task_manager.create_task(
         task_id,
         prompt,
@@ -161,17 +173,58 @@ async def create_task(
             name=AGENT_NAME,
             description="A versatile agent that can solve various tasks using multiple tools",
             llm=(
-                LLM(config_name=task_id, llm_config=llm_config) if llm_config else None
+                LLM(config_name=task_id, llm_config=llm_config_obj)
+                if llm_config_obj
+                else None
             ),
             enable_event_queue=True,  # Enable event queue
         ),
     )
-    asyncio.create_task(
-        run_task(
-            task.id,
-            language=preferences.get("language", "English") if preferences else None,
-        )
+
+    await task.agent.initialize(
+        task_id,
+        language=(
+            preferences_dict.get("language", "English") if preferences_dict else None
+        ),
+        tools=processed_tools,
     )
+
+    if files:
+        import os
+
+        task_dir = Path(
+            os.path.join(
+                config.workspace_root,
+                task.agent.task_dir.replace("/workspace/", ""),
+            )
+        )
+        task_dir.mkdir(parents=True, exist_ok=True)
+        for file in files or []:
+            print(task_dir)
+            print(file.filename)
+            file = cast(UploadFile, file)
+            try:
+                safe_filename = Path(file.filename).name
+                if not safe_filename:
+                    raise HTTPException(status_code=400, detail="Invalid filename")
+
+                file_path = task_dir / safe_filename
+
+                MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+                file_content = file.file.read()
+                if len(file_content) > MAX_FILE_SIZE:
+                    raise HTTPException(status_code=400, detail="File too large")
+
+                with open(file_path, "wb") as f:
+                    f.write(file_content)
+
+            except Exception as e:
+                logger.error(f"Error saving file {file.filename}: {str(e)}")
+                raise HTTPException(
+                    status_code=500, detail=f"Error saving file: {str(e)}"
+                )
+
+    asyncio.create_task(run_task(task.id))
     return {"task_id": task.id}
 
 
@@ -199,173 +252,123 @@ async def get_tasks():
     )
 
 
-@router.post("/{organization_id}/{task_id}/tool/ask_human/respond")
-async def respond_to_ask_human(
-    organization_id: str,
-    task_id: str,
-    interaction_id: str = Body(..., embed=True),
-    response: str = Body(..., embed=True),
+@router.post("/restart")
+async def restart_task(
+    task_id: str = Form(...),
+    prompt: str = Form(...),
+    tools: list[str] = Form(...),
+    preferences: Optional[str] = Form(None),
+    llm_config: Optional[str] = Form(None),
+    history: Optional[str] = Form(None),
+    files: list[UploadFile] = Form([]),
 ):
-    """Endpoint to handle responses to ask_human tool requests.
+    """Restart a task."""
+    # Parse JSON strings
+    preferences_dict = None
+    if preferences:
+        try:
+            preferences_dict = json.loads(preferences)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400, detail="Invalid preferences JSON format"
+            )
+
+    llm_config_obj = None
+    if llm_config:
+        try:
+            llm_config_obj = LLMSettings.model_validate_json(llm_config)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid llm_config format: {str(e)}"
+            )
+
+    history_list = None
+    if history:
+        try:
+            history_list = json.loads(history)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid history JSON format")
+
+    processed_tools = parse_tools(tools)
+
+    if task_id in task_manager.tasks:
+        task = task_manager.tasks[task_id]
+        await task.agent.terminate()
+
+    task = task_manager.create_task(
+        task_id,
+        prompt,
+        Manus(
+            name=AGENT_NAME,
+            description="A versatile agent that can solve various tasks using multiple tools",
+            llm=(
+                LLM(config_name=task_id, llm_config=llm_config_obj)
+                if llm_config_obj
+                else None
+            ),
+            enable_event_queue=True,
+        ),
+    )
+
+    if history_list:
+        for message in history_list:
+            if message["role"] == "user":
+                task.agent.update_memory(role="user", content=message["message"])
+            else:
+                task.agent.update_memory(role="assistant", content=message["message"])
+
+    await task.agent.initialize(
+        task_id,
+        language=(
+            preferences_dict.get("language", "English") if preferences_dict else None
+        ),
+        tools=processed_tools,
+    )
+
+    if files:
+        import os
+
+        task_dir = Path(os.path.join(config.workspace_root, task.agent.task_dir))
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        for file in files or []:
+            file = cast(UploadFile, file)
+            try:
+                safe_filename = Path(file.filename).name
+                if not safe_filename:
+                    raise HTTPException(status_code=400, detail="Invalid filename")
+
+                file_path = task_dir / safe_filename
+
+                MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+                file_content = file.file.read()
+                if len(file_content) > MAX_FILE_SIZE:
+                    raise HTTPException(status_code=400, detail="File too large")
+
+                with open(file_path, "wb") as f:
+                    f.write(file_content)
+
+            except Exception as e:
+                logger.error(f"Error saving file {file.filename}: {str(e)}")
+                raise HTTPException(
+                    status_code=500, detail=f"Error saving file: {str(e)}"
+                )
+
+    asyncio.create_task(run_task(task.id))
+    return {"task_id": task.id}
+
+
+@router.post("/terminate")
+async def terminate_task(task_id: str = Body(..., embed=True)):
+    """Terminate a task immediately.
 
     Args:
-        organization_id: The organization ID
-        task_id: The task ID
-        interaction_id: The interaction ID (tool_call_id)
-        response: The user's response
+        task_id: The ID of the task to terminate
     """
-    full_task_id = f"{organization_id}/{task_id}"
-    try:
-        if full_task_id not in task_manager.tasks:
-            return JSONResponse(
-                status_code=404,
-                content={"message": f"Task {full_task_id} not found"},
-            )
+    if task_id not in task_manager.tasks:
+        return {"message": f"Task {task_id} not found"}
 
-        task = task_manager.tasks[full_task_id]
-        agent = task.agent
+    task = task_manager.tasks[task_id]
+    await task.agent.terminate()
 
-        # Получаем последнее сообщение с вопросом, чтобы включить его в ответ
-        question = None
-        for msg in reversed(agent.messages):
-            if msg.role == "tool" and msg.name == "ask_human" and msg.tool_call_id == interaction_id:
-                # Извлекаем вопрос из сообщения tool
-                import re
-                match = re.search(r"Tool execution interrupted to ask user: (.*)", msg.content)
-                if match:
-                    question = match.group(1)
-                break
-
-        # Если не нашли вопрос, используем общую формулировку
-        if not question:
-            question = "your question"
-
-        # Добавляем ответ пользователя - в точности как в оригинальной системе
-        response_content = f'Regarding your question "{question}": {response}'
-        agent.update_memory(role="user", content=response_content)
-
-        # Emit an event for logging
-        if hasattr(agent, "emit"):
-            agent.emit(
-                "agent:message",
-                agent.current_step,
-                content=response_content,
-                role="user",
-                human_response=True,
-            )
-
-        logger.info(f"User response injected into agent memory for task {full_task_id}")
-
-        # Создаем новую задачу для продолжения работы агента
-        asyncio.create_task(continue_agent_execution(agent, full_task_id))
-
-        return JSONResponse(content={"status": "success"})
-    except Exception as e:
-        logger.error(f"Error processing response for task {full_task_id}: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"message": f"Error: {str(e)}"},
-        )
-
-
-async def continue_agent_execution(agent, task_id):
-    """Continue agent execution after receiving user response."""
-    try:
-        logger.info(f"Continuing agent execution for task {task_id} after human response")
-
-        # Сохраняем текущее состояние и шаг
-        original_state = agent.state
-        remaining_steps = agent.max_steps - agent.current_step
-
-        # Если у нас осталось слишком мало шагов, увеличим лимит
-        if remaining_steps < 3:
-            logger.warning(f"Too few steps remaining ({remaining_steps}), extending max_steps")
-            agent.max_steps += 10
-            remaining_steps = agent.max_steps - agent.current_step
-
-        logger.info(f"Continuing execution with up to {remaining_steps} remaining steps")
-
-        # Выполняем цикл, используя тот же паттерн, что и метод run()
-        results = []
-
-        # Переводим агента в состояние RUNNING с помощью контекстного менеджера
-        async with agent.state_context(AgentState.RUNNING):
-            while (agent.current_step < agent.max_steps and
-                   agent.state != AgentState.FINISHED):
-                # Увеличиваем счетчик шагов
-                agent.current_step += 1
-
-                # Выполняем очередной шаг
-                logger.info(f"Executing continuation step {agent.current_step}/{agent.max_steps}")
-                try:
-                    step_result = await agent.step()
-                    logger.info(f"Step completed with result: {step_result[:50]}..." if len(str(step_result)) > 50 else step_result)
-
-                    # Проверяем, не застрял ли агент
-                    if agent.is_stuck():
-                        agent.handle_stuck_state()
-
-                    results.append(f"Step {agent.current_step}: {step_result}")
-
-                except HumanInterventionRequired as hir:
-                    # Обработка запроса на взаимодействие с пользователем
-                    logger.info(f"Agent requested human input: {hir.question}")
-
-                    # Добавляем прерванное сообщение инструмента
-                    interrupted_tool_content = f"Tool execution interrupted to ask user: {hir.question}"
-                    agent.update_memory(
-                        role="tool",
-                        content=interrupted_tool_content,
-                        tool_call_id=hir.tool_call_id,
-                        name="ask_human"
-                    )
-
-                    # Отправляем событие интерфейсу
-                    if hasattr(agent, "emit"):
-                        agent.emit(
-                            "agent:tool:ask_human",
-                            agent.current_step,
-                            query=hir.question,
-                            interaction_id=hir.tool_call_id
-                        )
-                    # Выходим из цикла, чтобы дождаться ответа пользователя
-                    break
-
-                except Exception as e:
-                    error_msg = f"Error in step {agent.current_step}: {str(e)}"
-                    logger.error(error_msg)
-                    results.append(f"Step {agent.current_step}: {error_msg}")
-
-            # Проверяем, достигнут ли максимум шагов
-            if agent.current_step >= agent.max_steps:
-                logger.warning(f"Reached maximum steps ({agent.max_steps})")
-                agent.state = AgentState.IDLE  # Сброс состояния, как в BaseAgent.run()
-                if hasattr(agent, "emit"):
-                    agent.emit(
-                        "agent:lifecycle:complete",
-                        agent.current_step,
-                        result="Task completed: reached maximum steps"
-                    )
-
-        # Если агент завершил задачу, отправляем событие о завершении
-        if agent.state == AgentState.FINISHED and hasattr(agent, "emit"):
-            agent.emit(
-                "agent:lifecycle:complete",
-                agent.current_step,
-                result="Task completed successfully"
-            )
-
-        # Убедимся, что все события обработаны
-        queue = task_manager.queues[task_id]
-        await asyncio.sleep(0.1)  # Небольшая пауза для обработки событий
-        while not queue.empty():
-            await asyncio.sleep(0.1)
-
-        # Возвращаем агента в исходное состояние, если выполнение не было завершено
-        if agent.state != AgentState.FINISHED and agent.state != original_state:
-            agent.state = original_state
-
-    except Exception as e:
-        logger.error(f"Error in continue_agent_execution for {task_id}: {str(e)}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
+    return {"message": f"Task {task_id} terminated successfully", "task_id": task_id}
