@@ -11,6 +11,15 @@ interface ChatMessageProps {
 
 const UserMessage = ({ message }: { message: Message<{ request: string }> }) => <Markdown className="chat">{message.content.request}</Markdown>;
 
+const PlanMessage = ({ message }: { message: Message<{ plan: string }> }) => {
+  return (
+    <div className="container mx-auto max-w-4xl">
+      <div className="text-lg font-bold">📋 Manus</div>
+      <Markdown className="chat">{message.content.plan}</Markdown>
+    </div>
+  );
+};
+
 interface CompletionMessageProps {
   message: Message<{ results: string[]; total_input_tokens: number; total_completion_tokens: number }>;
 }
@@ -113,6 +122,15 @@ const LifecycleMessage = ({ message }: { message: AggregatedMessage }) => {
           return (
             <div key={index} className="container mx-auto flex max-w-4xl justify-end">
               <UserMessage message={msg as Message<{ request: string }>} />
+            </div>
+          );
+        }
+
+        // 处理生命周期开始计划
+        if (msg.type === 'agent:lifecycle:plan') {
+          return (
+            <div key={index} className="container mx-auto max-w-4xl">
+              <PlanMessage message={msg as Message<{ plan: string }>} />
             </div>
           );
         }

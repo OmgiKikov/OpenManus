@@ -53,6 +53,7 @@ BASE_AGENT_EVENTS_PREFIX = "agent:lifecycle"
 class BaseAgentEvents:
     # Lifecycle events
     LIFECYCLE_START = f"{BASE_AGENT_EVENTS_PREFIX}:start"
+    LIFECYCLE_PLAN = f"{BASE_AGENT_EVENTS_PREFIX}:plan"
     LIFECYCLE_COMPLETE = f"{BASE_AGENT_EVENTS_PREFIX}:complete"
     LIFECYCLE_TERMINATING = f"{BASE_AGENT_EVENTS_PREFIX}:terminating"
     LIFECYCLE_TERMINATED = f"{BASE_AGENT_EVENTS_PREFIX}:terminated"
@@ -290,6 +291,10 @@ class BaseAgent(BaseModel, ABC):
             BaseAgentEvents.MEMORY_ADDED, {"role": role, "message": message.to_dict()}
         )
 
+    async def plan(self, request: str) -> None:
+        """Plan the agent's actions for the given request."""
+        self.update_memory("user", request)
+
     async def run(self, request: Optional[str] = None) -> str:
         """Execute the agent's main loop asynchronously.
 
@@ -308,7 +313,7 @@ class BaseAgent(BaseModel, ABC):
         self.emit(BaseAgentEvents.LIFECYCLE_START, {"request": request})
 
         if request:
-            self.update_memory("user", request)
+            await self.plan(request)
 
         results: List[str] = []
         async with self.state_context(AgentState.RUNNING):

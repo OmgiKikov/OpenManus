@@ -260,7 +260,7 @@ async def restart_task(
     preferences: Optional[str] = Form(None),
     llm_config: Optional[str] = Form(None),
     history: Optional[str] = Form(None),
-    files: Optional[list[UploadFile]] = Form(None),
+    files: Optional[list[UploadFile]] = File(None),
 ):
     """Restart a task."""
     # Parse JSON strings

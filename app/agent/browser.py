@@ -214,7 +214,7 @@ class BrowserAgent(ToolCallAgent):
 
 
 def calculate_image_similarity(
-    img1_base64: str, img2_base64: str, threshold: float = 0.85
+    img1_base64: str, img2_base64: str, threshold: float = 0.9
 ) -> bool:
     """
     Calculate the similarity between two images using perceptual hashing method.

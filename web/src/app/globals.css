@@ -118,17 +118,16 @@
   * {
     @apply border-border outline-ring/50;
   }
-
   body {
     @apply bg-background text-foreground;
   }
 }
 
 .markdown-body {
-  @apply overflow-x-auto text-black;
+  @apply overflow-x-auto;
 }
 
 .markdown-body.chat {
-  @apply bg-muted text-black;
+  @apply bg-muted;
   font-size: 0.875rem;
 }

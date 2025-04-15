@@ -337,7 +337,7 @@ const WorkspacePreview = () => {
         <CardContent>
           <div className="overflow-hidden rounded-md border">
             {workspace instanceof Blob &&
-              (workspace.type.includes('image') || (data?.type === 'workspace' && data.path?.match(/\.(jpg|jpeg|png|gif|bmp|svg|webp)$/i))) ? (
+            (workspace.type.includes('image') || (data?.type === 'workspace' && data.path?.match(/\.(jpg|jpeg|png|gif|bmp|svg|webp)$/i))) ? (
               <Image
                 src={URL.createObjectURL(workspace)}
                 alt={data?.type === 'workspace' ? data.path || 'File preview' : 'File preview'}
@@ -456,7 +456,7 @@ const formatFileSize = (size: number): string => {
 const NotPreview = () => {
   return (
     <div className="flex h-full items-center justify-center">
-      <div className="animate-pulse text-black">Manus is not using the computer right now...</div>
+      <div className="animate-pulse text-gray-500">Manus is not using the computer right now...</div>
     </div>
   );
 };
