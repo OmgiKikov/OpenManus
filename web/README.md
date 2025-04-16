@@ -173,3 +173,38 @@ DATABASE_URL="postgresql://user:password@localhost:5432/dbname"
 ## Technical Support
 
 If you have any questions, please submit an Issue (or feel free to contact me directly - I'm always active in the OpenManus Feishu chat group).
+
+# 🚀 Быстрый старт (RU)
+
+### 1. Установите зависимости (только через uv):
+```sh
+uv run npm install --prefix web
+```
+
+### 2. Скопируйте .env в web (если он только в корне):
+```sh
+cp .env web/.env
+```
+
+### 3. Сгенерируйте ключи для шифрования:
+```sh
+uv run npm run generate-keys --prefix web
+```
+
+### 4. Инициализируйте базу данных и Prisma:
+```sh
+uv run npx prisma generate --prefix web
+uv run npx prisma db push --prefix web
+```
+
+### 5. Запустите фронтенд:
+```sh
+uv run npm run dev --prefix web
+```
+
+Фронтенд будет доступен на http://localhost:3000
+
+**Важно:**
+- Используйте только uv для всех npm-команд.
+- Если меняете ключи, очистите зашифрованные поля в базе (см. раздел "Частые ошибки").
+- Если видите ошибку с переменной окружения, убедитесь, что .env лежит в web/.

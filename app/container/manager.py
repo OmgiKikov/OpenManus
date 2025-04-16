@@ -37,7 +37,7 @@ class ContainerManager:
 
     def __init__(self):
         self.client = docker.from_env()
-        self.container_data_dir = os.getenv("CONTAINER_DATA_DIR", "/container_data")
+        self.container_data_dir = os.getenv("CONTAINER_DATA_DIR", "./container_data")
         self._ensure_data_dir()
 
     def _ensure_data_dir(self):
