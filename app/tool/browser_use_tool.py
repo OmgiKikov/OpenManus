@@ -1,19 +1,34 @@
 import asyncio
 import base64
 import json
+import os
 from typing import Generic, Optional, TypeVar
 
 from browser_use import Browser as BrowserUseBrowser
 from browser_use import BrowserConfig
 from browser_use.browser.context import BrowserContext, BrowserContextConfig
 from browser_use.dom.service import DomService
+from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
+from steel import Steel
+from steel.types import Session
 
 from app.config import config
 from app.llm import LLM
 from app.tool.base import BaseTool, ToolResult
 from app.tool.web_search import WebSearch
+
+load_dotenv()
+
+STEEL_API_KEY = os.getenv('STEEL_API_KEY')
+
+if not STEEL_API_KEY:
+    raise ValueError("STEEL_API_KEY not found in environment variables. Please ensure it's set in your .env file or environment.")
+
+client = Steel(steel_api_key=STEEL_API_KEY)
+
+
 
 _BROWSER_DESCRIPTION = """\
 A powerful browser automation tool that allows interaction with web pages through various actions.
@@ -122,6 +137,7 @@ class BrowserUseTool(BaseTool, Generic[Context]):
 
     lock: asyncio.Lock = Field(default_factory=asyncio.Lock)
     browser: Optional[BrowserUseBrowser] = Field(default=None, exclude=True)
+    session: Optional[Session] = Field(default=None, exclude=True)
     context: Optional[BrowserContext] = Field(default=None, exclude=True)
     dom_service: Optional[DomService] = Field(default=None, exclude=True)
     web_search_tool: WebSearch = Field(default_factory=WebSearch, exclude=True)
@@ -129,7 +145,7 @@ class BrowserUseTool(BaseTool, Generic[Context]):
     # Context for generic functionality
     tool_context: Optional[Context] = Field(default=None, exclude=True)
 
-    llm: Optional[LLM] = Field(default=None)
+    llm: Optional[LLM] = Field(default_factory=LLM)
 
     @field_validator("parameters", mode="before")
     def validate_parameters(cls, v: dict, info: ValidationInfo) -> dict:
@@ -140,7 +156,10 @@ class BrowserUseTool(BaseTool, Generic[Context]):
     async def _ensure_browser_initialized(self) -> BrowserContext:
         """Ensure browser and context are initialized."""
         if self.browser is None:
-            browser_config_kwargs = {"headless": True, "disable_security": True}
+            global client
+            self.session = client.sessions.create()
+            print(f"Session debug_url: {self.session.debug_url}")
+            browser_config_kwargs: BrowserConfig = {"cdp_url": f"wss://connect.steel.dev?apiKey={STEEL_API_KEY}&sessionId={self.session.id}"}
 
             if config.browser_config:
                 from browser_use.browser.browser import ProxySettings
@@ -225,7 +244,7 @@ class BrowserUseTool(BaseTool, Generic[Context]):
 
                 # Get max content length from config
                 max_content_length = getattr(
-                    config.browser_config, "max_content_length", 40000
+                    config.browser_config, "max_content_length", 2000
                 )
 
                 # Navigation actions
@@ -380,10 +399,19 @@ class BrowserUseTool(BaseTool, Generic[Context]):
                     page = await context.get_current_page()
                     import markdownify
 
-                    content = markdownify.markdownify(await page.content())
+                    # Configure markdownify to keep HTML attributes
+                    html_content = await page.content()
+                    md = markdownify.MarkdownConverter(strip=['script', 'style'],
+                                                     heading_style="ATX",
+                                                     bullets="-",
+                                                     convert=["a", "img", "p", "div", "span"],
+                                                     autolinks=True,
+                                                     keep_inline_images_in=["img"],
+                                                     keep_html_tags=["data-*", "class", "id", "style", "href", "value"])
+                    content = md.convert(html_content)
 
                     prompt = f"""\
-Your task is to extract the content of the page. You will be given a page and a goal, and you should extract all relevant information around this goal from the page. If the goal is vague, summarize the page. Respond in json format.
+Your task is to extract the content of the page. You will be given a page and a goal, and you should extract all relevant information around this goal from the page. If the goal is vague, summarize the page. The content includes HTML attributes that may be relevant. Respond in json format.
 Extraction goal: {goal}
 
 Page content:
@@ -516,7 +544,7 @@ Page content:
                 "tabs": [tab.model_dump() for tab in state.tabs],
                 "help": "[0], [1], [2], etc., represent clickable indices corresponding to the elements listed. Clicking on these indices will navigate to or interact with the respective content behind them.",
                 "interactive_elements": (
-                    state.element_tree.clickable_elements_to_string()
+                    state.element_tree.clickable_elements_to_string(include_attributes=["type", "placeholder", "value", "href", "role", "aria-label", "alt", "title"])
                     if state.element_tree
                     else ""
                 ),
@@ -547,6 +575,10 @@ Page content:
             if self.browser is not None:
                 await self.browser.close()
                 self.browser = None
+            if self.session is not None:
+                global client
+                client.sessions.release(self.session.id)
+                self.session = None
 
     def __del__(self):
         """Ensure cleanup when object is destroyed."""

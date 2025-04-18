@@ -15,6 +15,7 @@ from app.tool.file_operators import (
     SandboxFileOperator,
 )
 
+
 Command = Literal[
     "view",
     "create",
@@ -127,7 +128,7 @@ class StrReplaceEditor(BaseTool):
         operator = self._get_operator()
 
         # Validate path and command combination
-        await self.validate_path(command, path, operator)
+        await self.validate_path(command, Path(path), operator)
 
         # Execute the appropriate command
         if command == "view":
@@ -163,12 +164,12 @@ class StrReplaceEditor(BaseTool):
         return str(result)
 
     async def validate_path(
-        self, command: str, path: str, operator: FileOperator
+        self, command: str, path: Path, operator: FileOperator
     ) -> None:
         """Validate path and command combination based on execution environment."""
         # Check if path is absolute
-        if not path.startswith("/workspace"):
-            raise ToolError(f"The path {path} is not a valid path")
+        if not path.is_absolute():
+            raise ToolError(f"The path {path} is not an absolute path")
 
         # Only check if path exists for non-create commands
         if command != "create":
