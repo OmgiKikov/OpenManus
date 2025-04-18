@@ -8,9 +8,9 @@ from app.agent.react import ReActAgent
 from app.exceptions import TokenLimitExceeded
 from app.logger import logger
 from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
-from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
+from app.schema import (TOOL_CHOICE_TYPE, AgentState, Message, ToolCall,
+                        ToolChoice)
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
-
 
 TOOL_CALL_REQUIRED = "Tool calls required but none provided"
 
@@ -35,6 +35,8 @@ class ToolCallAgent(ReActAgent):
 
     max_steps: int = 30
     max_observe: Optional[Union[int, bool]] = None
+    # Maximum number of retries for tool execution
+    max_retries: int = Field(default=3, description="Maximum number of retries for tool execution")
 
     async def think(self) -> bool:
         """Process current state and decide next actions using tools"""
@@ -137,6 +139,11 @@ class ToolCallAgent(ReActAgent):
             # Return last message content if no tool calls
             return self.messages[-1].content or "No content or commands to execute"
 
+        # Enforce only one tool call per iteration
+        if len(self.tool_calls) > 1:
+            logger.warning(f"{self.name} received {len(self.tool_calls)} tool calls; executing only the first one")
+            self.tool_calls = self.tool_calls[:1]
+
         results = []
         for command in self.tool_calls:
             # Reset base64_image for each tool call
@@ -176,9 +183,19 @@ class ToolCallAgent(ReActAgent):
             # Parse arguments
             args = json.loads(command.function.arguments or "{}")
 
-            # Execute the tool
-            logger.info(f"🔧 Activating tool: '{name}'...")
-            result = await self.available_tools.execute(name=name, tool_input=args)
+            # Retry logic for executing the tool
+            result = None
+            for attempt in range(self.max_retries):
+                try:
+                    logger.info(f"🔧 Activating tool: '{name}' (attempt {attempt+1}/{self.max_retries})...")
+                    result = await self.available_tools.execute(name=name, tool_input=args)
+                    break
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt+1}/{self.max_retries} for tool '{name}' failed: {e}")
+                    if attempt == self.max_retries - 1:
+                        logger.error(f"🔧 Max retries reached for tool '{name}'.")
+                        raise
+                    await asyncio.sleep(1)
 
             # Handle special tools
             await self._handle_special_tool(name=name, result=result)

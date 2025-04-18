@@ -16,6 +16,7 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 # 导入OpenManus组件
 from app.agent.manus import Manus
+from app.human_queue import human_queue
 from app.logger import logger
 from app.tool.base import ToolResult
 
@@ -189,6 +190,14 @@ def send_message():
 
 @app.route('/api/status/<task_id>', methods=['GET'])
 def check_status(task_id):
+    # Проверяем, ожидает ли задача ответа от человека
+    if human_queue.has_pending_question(task_id):
+        return jsonify({
+            "status": "awaiting_human",
+            "question": human_queue.get_current_question(task_id),
+            "message": "Задача ожидает ответа от пользователя"
+        })
+
     # 检查任务是否完成
     if task_id in task_results:
         result = task_results[task_id]
@@ -200,13 +209,13 @@ def check_status(task_id):
     if task_id in active_tasks:
         return jsonify({
             "status": "processing",
-            "message": "任务正在处理中"
+            "message": "Задача обрабатывается"
         })
 
     # 任务不存在
     return jsonify({
         "status": "not_found",
-        "message": "任务未找到"
+        "message": "Задача не найдена"
     }), 404
 
 # 获取实时日志的API端点
@@ -231,6 +240,43 @@ def get_logs(task_id):
         "logs": [],
         "next_index": last_index
     })
+
+# endpoint для ответов пользователя
+@app.route('/api/human_response', methods=['POST'])
+def submit_human_response():
+    data = request.json
+    task_id = data.get('task_id')
+    response = data.get('response', '').strip()
+
+    if not task_id or not response:
+        return jsonify({
+            "status": "error",
+            "message": "ID задачи и ответ обязательны"
+        }), 400
+
+    # Проверяем, есть ли активный вопрос для этой задачи
+    if not human_queue.has_pending_question(task_id):
+        return jsonify({
+            "status": "error",
+            "message": "Для этой задачи нет активных вопросов"
+        }), 400
+
+    # Добавляем ответ в очередь
+    success = human_queue.add_response(task_id, response)
+
+    if success:
+        # Добавляем ответ в логи для отображения в UI
+        add_log(task_id, f"[USER_RESPONSE] {response}", "INFO")
+
+        return jsonify({
+            "status": "success",
+            "message": "Ответ успешно обработан"
+        })
+    else:
+        return jsonify({
+            "status": "error",
+            "message": "Не удалось обработать ответ"
+        }), 500
 
 # 主程序
 if __name__ == "__main__":

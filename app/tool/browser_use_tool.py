@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 from typing import Generic, Optional, TypeVar
 
 from browser_use import Browser as BrowserUseBrowser
@@ -16,6 +17,7 @@ from steel.types import Session
 
 from app.config import config
 from app.llm import LLM
+from app.logger import logger
 from app.tool.base import BaseTool, ToolResult
 from app.tool.web_search import WebSearch
 
@@ -399,16 +401,24 @@ class BrowserUseTool(BaseTool, Generic[Context]):
                     page = await context.get_current_page()
                     import markdownify
 
-                    # Configure markdownify to keep HTML attributes
+                    # Get raw HTML
                     html_content = await page.content()
-                    md = markdownify.MarkdownConverter(strip=['script', 'style'],
-                                                     heading_style="ATX",
-                                                     bullets="-",
-                                                     convert=["a", "img", "p", "div", "span"],
-                                                     autolinks=True,
-                                                     keep_inline_images_in=["img"],
-                                                     keep_html_tags=["data-*", "class", "id", "style", "href", "value"])
-                    content = md.convert(html_content)
+                    # Try converting to markdown; fallback on error
+                    try:
+                        md = markdownify.MarkdownConverter(
+                            strip=['script', 'style'],
+                            heading_style="ATX",
+                            bullets="-",
+                            convert=["a", "img", "p", "div", "span"],
+                            autolinks=True,
+                            keep_inline_images_in=["img"],
+                            keep_html_tags=["data-*", "class", "id", "style", "href", "value"]
+                        )
+                        content = md.convert(html_content)
+                    except ValueError as e:
+                        logger.warning(f"extract_content markdownify failed, fallback to plain text: {e}")
+                        # Strip all HTML tags for fallback content
+                        content = re.sub(r'<[^>]+>', '', html_content)
 
                     prompt = f"""\
 Your task is to extract the content of the page. You will be given a page and a goal, and you should extract all relevant information around this goal from the page. If the goal is vague, summarize the page. The content includes HTML attributes that may be relevant. Respond in json format.
