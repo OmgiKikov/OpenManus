@@ -24,18 +24,18 @@ const Sidebar = () => {
       </header>
 
       <div className="p-4 border-b border-gray-200">
-        <button 
+        <button
           onClick={handleNewChat}
           className="w-full bg-brand-500 hover:bg-brand-600 text-white py-2 px-4 rounded-md transition-colors duration-200 flex items-center justify-center"
         >
           <PlusIcon className="h-5 w-5 mr-1" />
-          新任务
+          Новая задача
         </button>
       </div>
 
       <div className="flex-1 overflow-y-auto p-2">
         <h2 className="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-2 px-2">
-          历史记录
+          История
         </h2>
         <div id="history-list" className="space-y-1">
           {/* History items will be rendered here */}
@@ -43,16 +43,16 @@ const Sidebar = () => {
       </div>
 
       <div className="p-4 border-t border-gray-200">
-        <button 
+        <button
           onClick={handleClearHistory}
           className="w-full bg-gray-200 hover:bg-gray-300 text-gray-700 py-2 px-4 rounded-md transition-colors duration-200 flex items-center justify-center"
         >
           <TrashIcon className="h-5 w-5 mr-1" />
-          清空历史
+          Очистить историю
         </button>
       </div>
     </div>
   );
 };
 
-export default Sidebar; 
+export default Sidebar;

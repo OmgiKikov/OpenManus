@@ -13,15 +13,15 @@ const Logger = ({ currentTaskId }) => {
     // Set up log polling
     const pollLogs = async () => {
       if (isPaused || !currentTaskId) return;
-      
+
       try {
         const response = await fetch(`http://localhost:8009/api/logs/${currentTaskId}?last_index=${lastIndex}`);
         const data = await response.json();
-        
+
         if (data.logs && data.logs.length > 0) {
           setLogs(prevLogs => [...prevLogs, ...data.logs]);
           setLastIndex(data.next_index);
-          
+
           if (autoScroll && outputRef.current) {
             setTimeout(() => {
               outputRef.current.scrollTop = outputRef.current.scrollHeight;
@@ -56,16 +56,16 @@ const Logger = ({ currentTaskId }) => {
 
   const getLogClassName = (log) => {
     let className = 'mb-1 leading-relaxed ';
-    
+
     if (log.message.includes('thoughts') || log.message.includes('思考')) {
       return className + 'text-blue-400 italic';
     }
-    
+
     if (log.message.includes('执行工具') || log.message.includes('Activating tool')) {
       return className + 'text-purple-500 font-semibold';
     }
-    
-    switch(log.level) {
+
+    switch (log.level) {
       case 'ERROR':
         return className + 'text-red-500';
       case 'WARNING':
@@ -79,9 +79,9 @@ const Logger = ({ currentTaskId }) => {
 
   const shouldShowLog = (log) => {
     if (filter === 'all') return true;
-    
+
     const message = log.message;
-    
+
     switch (filter) {
       case 'info':
         return log.level === 'INFO' || (!message.includes('ERROR') && !message.includes('WARNING') && !message.includes('执行工具'));
@@ -100,44 +100,44 @@ const Logger = ({ currentTaskId }) => {
     <div className="h-full flex flex-col">
       <div className="bg-gray-800 border-b border-gray-700 p-2 flex items-center">
         <div className="flex items-center space-x-2">
-          <button 
+          <button
             onClick={handleClearLogs}
             className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded-md"
           >
-            清空日志
+            Очистить логи
           </button>
-          <button 
+          <button
             onClick={toggleAutoScroll}
             className={`px-3 py-1 ${autoScroll ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-700 hover:bg-gray-600'} text-white text-xs rounded-md`}
           >
-            自动滚动: {autoScroll ? '开' : '关'}
+            Автопрокрутка: {autoScroll ? 'Вкл' : 'Выкл'}
           </button>
           <button
             onClick={toggleRecording}
             className={`px-3 py-1 ${isRecording ? 'text-red-500' : 'text-gray-400'} hover:bg-gray-600 text-xs rounded-md`}
           >
-            记录
+            Запись
           </button>
           <button
             onClick={togglePause}
             className={`px-3 py-1 ${isPaused ? 'text-yellow-500' : 'text-gray-400'} hover:bg-gray-600 text-xs rounded-md`}
           >
-            暂停
+            Пауза
           </button>
           <select
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             className="bg-gray-700 text-white text-xs rounded-md px-2 py-1 border border-gray-600"
           >
-            <option value="all">所有日志</option>
-            <option value="info">信息</option>
-            <option value="warning">警告</option>
-            <option value="error">错误</option>
-            <option value="tool">工具执行</option>
+            <option value="all">Все логи</option>
+            <option value="info">Информация</option>
+            <option value="warning">Предупреждения</option>
+            <option value="error">Ошибки</option>
+            <option value="tool">Инструменты</option>
           </select>
         </div>
       </div>
-      <div 
+      <div
         ref={outputRef}
         className="flex-1 overflow-y-auto p-4 bg-gray-900 text-gray-200 font-mono text-sm scrollbar-thin"
         style={{ height: 'calc(100% - 40px)' }}
@@ -159,4 +159,4 @@ const Logger = ({ currentTaskId }) => {
   );
 };
 
-export default Logger; 
+export default Logger;

@@ -35,7 +35,7 @@ const Browser = ({ logs }) => {
           className="w-full h-full border-none"
           sandbox="allow-same-origin allow-scripts"
           src={url}
-          title="Browser preview window"
+          title="Предпросмотр браузера"
         />
       </div>
     </div>

@@ -10,7 +10,7 @@ const RightPanel = ({ activeTab, setActiveTab, currentTaskId, logs }) => {
   const tabs = useMemo(() => [
     {
       id: 'browser',
-      name: '浏览器',
+      name: 'Браузер',
       icon: GlobeAltIcon,
       component: BrowserComponent
     }
@@ -24,11 +24,10 @@ const RightPanel = ({ activeTab, setActiveTab, currentTaskId, logs }) => {
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
-              className={`tab-button px-3 py-1.5 font-medium text-sm rounded-md ${
-                activeTab === tab.id
-                  ? 'bg-brand-50 text-brand-700'
-                  : 'text-gray-600 hover:bg-gray-50'
-              }`}
+              className={`tab-button px-3 py-1.5 font-medium text-sm rounded-md ${activeTab === tab.id
+                ? 'bg-brand-50 text-brand-700'
+                : 'text-gray-600 hover:bg-gray-50'
+                }`}
             >
               <tab.icon className="h-4 w-4 inline-block mr-1" />
               {tab.name}

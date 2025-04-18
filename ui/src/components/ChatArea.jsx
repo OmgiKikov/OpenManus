@@ -13,7 +13,7 @@ const ChatArea = ({
   onStopLoading
 }) => {
   const [messages, setMessages] = useState([{
-    content: '你好！我是OpenManus智能助手。请输入您的问题或指令，我会尽力帮助您。',
+    content: 'Привет! Я интеллектуальный помощник OpenAgent. Введите ваш вопрос или команду, и я постараюсь помочь.',
     sender: 'bot',
     timestamp: new Date().toISOString(),
     isStepMessage: true
@@ -163,7 +163,7 @@ const ChatArea = ({
     };
 
     setMessages(prev => [...prev, newMessage, {
-      content: '思考中...',
+      content: 'Думаю...',
       sender: 'bot',
       timestamp: new Date().toISOString(),
       isStepMessage: true
@@ -187,7 +187,7 @@ const ChatArea = ({
       setMessages(prev => {
         const filteredMessages = prev.filter(msg => msg.sender !== 'bot');
         return [...filteredMessages, {
-          content: '发送请求时出错，请重试',
+          content: 'Ошибка при отправке запроса, попробуйте снова.',
           sender: 'bot',
           timestamp: new Date().toISOString()
         }];
@@ -212,11 +212,10 @@ const ChatArea = ({
             className={`flex items-start ${message.sender === 'bot' ? 'bot-message' : 'user-message'}`}
           >
             <div className="flex-shrink-0 mr-3">
-              <div className={`h-8 w-8 rounded-full flex items-center justify-center ${
-                message.sender === 'bot' && message.isStepMessage
-                  ? 'bg-brand-100 text-brand-600'
-                  : message.sender === 'user' ? 'bg-gray-100 text-gray-600' : ''
-              }`}>
+              <div className={`h-8 w-8 rounded-full flex items-center justify-center ${message.sender === 'bot' && message.isStepMessage
+                ? 'bg-brand-100 text-brand-600'
+                : message.sender === 'user' ? 'bg-gray-100 text-gray-600' : ''
+                }`}>
                 {
                   message.sender === 'user' && (
                     <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -231,9 +230,8 @@ const ChatArea = ({
                 )}
               </div>
             </div>
-            <div className={`flex-1 ${
-              message.sender === 'bot' ? 'bg-gray-50' : 'bg-brand-50'
-            } rounded-lg p-4`}>
+            <div className={`flex-1 ${message.sender === 'bot' ? 'bg-gray-50' : 'bg-brand-50'
+              } rounded-lg p-4`}>
               <div
                 className={`${message.sender === 'bot' ? 'text-gray-800' : 'text-gray-800'}`}
                 dangerouslySetInnerHTML={{ __html: formatMessage(message.content) }}
@@ -251,18 +249,17 @@ const ChatArea = ({
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyPress={handleKeyPress}
-            placeholder="输入您的问题或指令..."
+            placeholder="Введите ваш вопрос или команду..."
             className="flex-1 px-4 py-2 border border-gray-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
           />
           <button
             onClick={handleSendMessage}
             disabled={isLoading || !inputValue.trim()}
-            className={`bg-brand-500 hover:bg-brand-600 text-white px-4 py-2 rounded-r-lg transition-colors duration-200 flex items-center ${
-              isLoading || !inputValue.trim() ? 'opacity-50 cursor-not-allowed' : ''
-            }`}
+            className={`bg-brand-500 hover:bg-brand-600 text-white px-4 py-2 rounded-r-lg transition-colors duration-200 flex items-center ${isLoading || !inputValue.trim() ? 'opacity-50 cursor-not-allowed' : ''
+              }`}
           >
             <PaperAirplaneIcon className="h-5 w-5 mr-1" />
-            发送
+            Отправить
           </button>
         </div>
       </div>
