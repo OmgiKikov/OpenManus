@@ -7,15 +7,18 @@ import threading
 import time
 import uuid
 from io import StringIO
+from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
 
 # Configure Werkzeug logger to only show WARNING and above
-logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
-# 导入OpenManus组件
+# 导入OpenAgent组件
 from app.agent.manus import Manus
+from app.config import config
+from app.flow.flow_factory import FlowFactory, FlowType
 from app.human_queue import human_queue
 from app.logger import logger
 from app.tool.base import ToolResult
@@ -31,17 +34,15 @@ task_results = {}
 saved_files = {}  # 保存文件记录
 task_logs_queue = {}  # 存储每个任务的日志队列
 
+
 # Move add_log function definition before RealTimeStringIO class
 def add_log(task_id, message, level="INFO"):
-    log_entry = {
-        "timestamp": time.time(),
-        "level": level,
-        "message": message
-    }
+    log_entry = {"timestamp": time.time(), "level": level, "message": message}
     task_logs_queue[task_id].append(log_entry)
     # Use sys.__stdout__ to avoid recursion
     sys.__stdout__.write(f"[{level}] {message}\n")
     sys.__stdout__.flush()
+
 
 # Add this custom StringIO class
 class RealTimeStringIO(StringIO):
@@ -62,15 +63,12 @@ class RealTimeStringIO(StringIO):
                 level = "ERROR"
 
             # Add to task logs without recursive printing
-            log_entry = {
-                "timestamp": time.time(),
-                "level": level,
-                "message": s.strip()
-            }
+            log_entry = {"timestamp": time.time(), "level": level, "message": s.strip()}
             task_logs_queue[self.task_id].append(log_entry)
 
         # Still maintain the StringIO functionality
         return super().write(s)
+
 
 # 初始化Manus
 def initialize_agent():
@@ -83,12 +81,19 @@ def initialize_agent():
         logger.info("Manus Agent初始化完成")
     return manus_agent
 
+
 async def async_initialize_agent():
     return Manus()
+
 
 # 处理用户输入的异步函数
 async def process_prompt(task_id, message):
     global manus_agent, task_results, saved_files, task_logs_queue
+    # Import FlowFactory for planning flow
+    from app.flow.flow_factory import FlowFactory, FlowType
+
+    # 获取当前任务的 flow_type
+    flow_type = active_tasks.get(task_id, {}).get("flow_type", "default")
 
     task_logs_queue[task_id] = []
 
@@ -106,8 +111,18 @@ async def process_prompt(task_id, message):
     try:
         logger.info(f"开始处理任务 {task_id}...")
 
-        # 运行处理
-        result = await manus_agent.run(message)
+        # 运行处理，根据 flow_type 选择标准执行或规划流
+        if flow_type == FlowType.PLANNING.value:
+            # Передаём plan_id в PlanningFlow
+            plan_id = active_tasks[task_id].get("plan_id")
+            flow = FlowFactory.create_flow(
+                flow_type=FlowType.PLANNING,
+                agents={"manus": manus_agent},
+                plan_id=plan_id,
+            )
+            result = await flow.execute(message)
+        else:
+            result = await manus_agent.run(message)
 
         # 恢复标准输出和错误
         sys.stdout = old_stdout
@@ -117,7 +132,8 @@ async def process_prompt(task_id, message):
         task_results[task_id] = {
             "status": "completed",
             "result": result,
-            "has_logs": True
+            "has_logs": True,
+            "plan_id": active_tasks[task_id].get("plan_id"),
         }
 
         logger.info(f"任务 {task_id} 完成")
@@ -130,13 +146,14 @@ async def process_prompt(task_id, message):
         logger.error(error_msg)
 
         import traceback
+
         traceback_str = traceback.format_exc()
         logger.error(traceback_str)
 
         task_results[task_id] = {
             "status": "error",
             "result": error_msg,
-            "has_logs": True
+            "has_logs": True,
         }
     finally:
         # Clear logging context
@@ -145,6 +162,7 @@ async def process_prompt(task_id, message):
     if task_id in active_tasks:
         del active_tasks[task_id]
 
+
 # 运行异步任务的函数
 def run_async_task(task_id, coro):
     loop = asyncio.new_event_loop()
@@ -152,20 +170,22 @@ def run_async_task(task_id, coro):
     loop.run_until_complete(coro)
     loop.close()
 
-@app.route('/api/send', methods=['POST'])
+
+@app.route("/api/send", methods=["POST"])
 def send_message():
     # 确保agent已初始化
     initialize_agent()
 
     # 获取用户消息
     data = request.json
-    message = data.get('message', '').strip()
+    message = data.get("message", "").strip()
+    # 获取可选 flow_type, 默认为 default
+    flow_type = data.get("flow_type", "default").strip().lower()
+    # 获取可选 plan_id, если нет — создаём новый
+    plan_id = data.get("plan_id") or str(uuid.uuid4())
 
     if not message:
-        return jsonify({
-            "status": "error",
-            "message": "消息不能为空"
-        }), 400
+        return jsonify({"status": "error", "message": "消息不能为空"}), 400
 
     # 创建任务ID
     task_id = str(uuid.uuid4())
@@ -173,30 +193,32 @@ def send_message():
     # 创建任务
     active_tasks[task_id] = {
         "message": message,
-        "created_at": time.time()
+        "created_at": time.time(),
+        "flow_type": flow_type,
+        "plan_id": plan_id,
     }
 
     # 启动异步处理线程
     thread = threading.Thread(
         target=run_async_task,
-        args=(task_id, process_prompt(task_id, message))
+        args=(task_id, process_prompt(task_id, message)),
     )
     thread.start()
 
-    return jsonify({
-        "status": "processing",
-        "task_id": task_id
-    })
+    return jsonify({"status": "processing", "task_id": task_id, "plan_id": plan_id})
 
-@app.route('/api/status/<task_id>', methods=['GET'])
+
+@app.route("/api/status/<task_id>", methods=["GET"])
 def check_status(task_id):
     # Проверяем, ожидает ли задача ответа от человека
     if human_queue.has_pending_question(task_id):
-        return jsonify({
-            "status": "awaiting_human",
-            "question": human_queue.get_current_question(task_id),
-            "message": "Задача ожидает ответа от пользователя"
-        })
+        return jsonify(
+            {
+                "status": "awaiting_human",
+                "question": human_queue.get_current_question(task_id),
+                "message": "Задача ожидает ответа от пользователя",
+            }
+        )
 
     # 检查任务是否完成
     if task_id in task_results:
@@ -207,22 +229,28 @@ def check_status(task_id):
 
     # 检查任务是否正在处理
     if task_id in active_tasks:
-        return jsonify({
-            "status": "processing",
-            "message": "Задача обрабатывается"
-        })
+        return jsonify({"status": "processing", "message": "Задача обрабатывается"})
 
     # 任务不存在
-    return jsonify({
-        "status": "not_found",
-        "message": "Задача не найдена"
-    }), 404
+    return jsonify({"status": "not_found", "message": "Задача не найдена"}), 404
+
+
+# Endpoint to fetch the current todo plan
+@app.route("/api/todo", methods=["GET"])
+def get_todo():
+    todo_path = Path(config.workspace_root) / "todo.md"
+    if todo_path.exists():
+        content = todo_path.read_text(encoding="utf-8")
+    else:
+        content = ""
+    return jsonify({"content": content})
+
 
 # 获取实时日志的API端点
-@app.route('/api/logs/<task_id>', methods=['GET'])
+@app.route("/api/logs/<task_id>", methods=["GET"])
 def get_logs(task_id):
     # 获取上次请求的日志索引
-    last_index = request.args.get('last_index', 0)
+    last_index = request.args.get("last_index", 0)
     try:
         last_index = int(last_index)
     except ValueError:
@@ -231,35 +259,32 @@ def get_logs(task_id):
     # 获取新日志
     if task_id in task_logs_queue:
         logs = task_logs_queue[task_id][last_index:]
-        return jsonify({
-            "logs": logs,
-            "next_index": last_index + len(logs)
-        })
+        return jsonify({"logs": logs, "next_index": last_index + len(logs)})
 
-    return jsonify({
-        "logs": [],
-        "next_index": last_index
-    })
+    return jsonify({"logs": [], "next_index": last_index})
+
 
 # endpoint для ответов пользователя
-@app.route('/api/human_response', methods=['POST'])
+@app.route("/api/human_response", methods=["POST"])
 def submit_human_response():
     data = request.json
-    task_id = data.get('task_id')
-    response = data.get('response', '').strip()
+    task_id = data.get("task_id")
+    response = data.get("response", "").strip()
 
     if not task_id or not response:
-        return jsonify({
-            "status": "error",
-            "message": "ID задачи и ответ обязательны"
-        }), 400
+        return (
+            jsonify({"status": "error", "message": "ID задачи и ответ обязательны"}),
+            400,
+        )
 
     # Проверяем, есть ли активный вопрос для этой задачи
     if not human_queue.has_pending_question(task_id):
-        return jsonify({
-            "status": "error",
-            "message": "Для этой задачи нет активных вопросов"
-        }), 400
+        return (
+            jsonify(
+                {"status": "error", "message": "Для этой задачи нет активных вопросов"}
+            ),
+            400,
+        )
 
     # Добавляем ответ в очередь
     success = human_queue.add_response(task_id, response)
@@ -268,15 +293,13 @@ def submit_human_response():
         # Добавляем ответ в логи для отображения в UI
         add_log(task_id, f"[USER_RESPONSE] {response}", "INFO")
 
-        return jsonify({
-            "status": "success",
-            "message": "Ответ успешно обработан"
-        })
+        return jsonify({"status": "success", "message": "Ответ успешно обработан"})
     else:
-        return jsonify({
-            "status": "error",
-            "message": "Не удалось обработать ответ"
-        }), 500
+        return (
+            jsonify({"status": "error", "message": "Не удалось обработать ответ"}),
+            500,
+        )
+
 
 # 主程序
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ const ChatArea = ({
   // New state for tracking if we're waiting for human input
   const [isAwaitingHuman, setIsAwaitingHuman] = useState(false);
   const [currentHumanQuestion, setCurrentHumanQuestion] = useState('');
+  // New state for selecting flow type (default or planning)
+  const [flowType, setFlowType] = useState('default');
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -270,7 +272,7 @@ const ChatArea = ({
           headers: {
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({ message: inputValue })
+          body: JSON.stringify({ message: inputValue, flow_type: flowType })
         });
 
         const data = await response.json();
@@ -359,6 +361,18 @@ const ChatArea = ({
       </div>
 
       <div className="p-4 border-t border-gray-200 bg-white">
+        <div className="mb-2 flex items-center">
+          <label htmlFor="flowType" className="text-sm mr-2">Режим:</label>
+          <select
+            id="flowType"
+            value={flowType}
+            onChange={e => setFlowType(e.target.value)}
+            className="border border-gray-300 rounded px-2 py-1 text-sm"
+          >
+            <option value="default">Обычный</option>
+            <option value="planning">Планирование</option>
+          </select>
+        </div>
         <div className="flex">
           <input
             type="text"

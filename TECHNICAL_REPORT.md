@@ -1,7 +1,7 @@
-# OpenManus Technical Report
+# OpenAgent Technical Report
 
 ## Overview
-OpenManus is an open-source framework for building general AI agents, implemented in Python. It provides a flexible and extensible architecture for creating agents that can interact with various tools and perform complex tasks.
+OpenAgent is an open-source framework for building general AI agents, implemented in Python. It provides a flexible and extensible architecture for creating agents that can interact with various tools and perform complex tasks.
 
 ## Core Architecture
 
@@ -157,8 +157,8 @@ Developers can create new tools by:
 
 1. **Setup**
 ```bash
-git clone https://github.com/mannaandpoem/OpenManus.git
-cd OpenManus
+git clone https://github.com/mannaandpoem/OpenAgent.git
+cd OpenAgent
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -192,6 +192,6 @@ pre-commit run --all-files  # Run pre-commit checks
 
 ## Conclusion
 
-OpenManus provides a robust and extensible framework for building AI agents. Its modular architecture, comprehensive tool system, and clear extension points make it suitable for a wide range of applications. Developers can easily extend the system while maintaining its core reliability and functionality.
+OpenAgent provides a robust and extensible framework for building AI agents. Its modular architecture, comprehensive tool system, and clear extension points make it suitable for a wide range of applications. Developers can easily extend the system while maintaining its core reliability and functionality.
 
 The system's emphasis on proper resource management, error handling, and clean architecture makes it a solid foundation for building complex AI agent applications.

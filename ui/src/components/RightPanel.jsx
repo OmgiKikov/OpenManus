@@ -1,18 +1,26 @@
 import React, { useMemo } from 'react';
 import Browser from './Browser';
-import { GlobeAltIcon } from '@heroicons/react/24/outline';
+import PlanPanel from './PlanPanel';
+import { GlobeAltIcon, DocumentTextIcon } from '@heroicons/react/24/outline';
 
 // Move component creation outside render function
 const BrowserComponent = ({ logs }) => <Browser logs={logs} />;
+const PlanComponent = () => <PlanPanel />;
 
 const RightPanel = ({ activeTab, setActiveTab, currentTaskId, logs }) => {
-  // Memoize tabs array
+  // Memoize tabs array with Browser and Plan tabs
   const tabs = useMemo(() => [
     {
       id: 'browser',
       name: 'Браузер',
       icon: GlobeAltIcon,
       component: BrowserComponent
+    },
+    {
+      id: 'plan',
+      name: 'План',
+      icon: DocumentTextIcon,
+      component: PlanComponent
     }
   ], []); // Empty dependency array since tabs never change
 
@@ -42,7 +50,8 @@ const RightPanel = ({ activeTab, setActiveTab, currentTaskId, logs }) => {
             key={tab.id}
             className={`h-full ${activeTab === tab.id ? '' : 'hidden'}`}
           >
-            <tab.component logs={logs} />
+            {/* Pass logs only to browser component */}
+            <tab.component {...(tab.id === 'browser' ? { logs } : {})} />
           </div>
         ))}
       </div>

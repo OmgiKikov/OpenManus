@@ -11,6 +11,7 @@ from app.llm import LLM
 from app.logger import logger
 from app.schema import AgentState, Message, ToolChoice
 from app.tool import PlanningTool
+from app.tool.base import ToolResult
 
 
 class PlanStepStatus(str, Enum):
@@ -97,18 +98,19 @@ class PlanningFlow(BaseFlow):
             if not self.primary_agent:
                 raise ValueError("No primary agent available")
 
-            # Create initial plan if input provided
+            result = ""
+            # Если есть входной текст — обновляем существующий план или создаём новый
             if input_text:
+                if self.active_plan_id in self.planning_tool.plans:
+                    # Обновление существующего плана
+                    return await self._update_plan_from_message(input_text)
+                # Создание нового плана
                 await self._create_initial_plan(input_text)
-
-                # Verify plan was created successfully
+                # Проверка успешности создания
                 if self.active_plan_id not in self.planning_tool.plans:
-                    logger.error(
-                        f"Plan creation failed. Plan ID {self.active_plan_id} not found in planning tool."
-                    )
+                    logger.error(f"Plan creation failed. Plan ID {self.active_plan_id} not found in planning tool.")
                     return f"Failed to create plan for: {input_text}"
 
-            result = ""
             while True:
                 # Get current step to execute
                 self.current_step_index, step_info = await self._get_current_step_info()
@@ -191,6 +193,42 @@ class PlanningFlow(BaseFlow):
                 "steps": ["Analyze request", "Execute task", "Verify results"],
             }
         )
+
+    async def _update_plan_from_message(self, message: str) -> str:
+        """Update existing plan based on a new user message."""
+        logger.info(f"Обновление плана {self.active_plan_id} по новому сообщению: {message}")
+        # Подготовка сообщений для LLM
+        system_message = Message.system_message(
+            "Вы – ассистент по планированию. Обновите существующий план на основе нового сообщения пользователя."
+        )
+        user_message = Message.user_message(
+            f"Обновите план (ID: {self.active_plan_id}) на основе: {message}"
+        )
+        # Запрос к LLM с использованием PlanningTool
+        response = await self.llm.ask_tool(
+            messages=[user_message],
+            system_msgs=[system_message],
+            tools=[self.planning_tool.to_param()],
+            tool_choice=ToolChoice.AUTO,
+        )
+        # Обработка возможных вызовов PlanningTool
+        if response.tool_calls:
+            for tool_call in response.tool_calls:
+                if tool_call.function.name == "planning":
+                    args = tool_call.function.arguments
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            logger.error(f"Не удалось разобрать arguments: {args}")
+                            continue
+                    args["plan_id"] = self.active_plan_id
+                    result: ToolResult = await self.planning_tool.execute(**args)
+                    logger.info(f"Результат обновления плана: {result.output}")
+                    return result.output
+        # Фолбэк: возвращаем текущий план, если нет tool_calls
+        logger.warning("PlanningFlow: tool_calls не вернулось, возвращаем текущий план.")
+        return await self._get_plan_text()
 
     async def _get_current_step_info(self) -> tuple[Optional[int], Optional[dict]]:
         """
@@ -283,6 +321,13 @@ class PlanningFlow(BaseFlow):
             return step_result
         except Exception as e:
             logger.error(f"Error executing step {self.current_step_index}: {e}")
+            # Mark the step as blocked and skip to the next step
+            await self.planning_tool.execute(
+                command="mark_step",
+                plan_id=self.active_plan_id,
+                step_index=self.current_step_index,
+                step_status=PlanStepStatus.BLOCKED.value,
+            )
             return f"Error executing step {self.current_step_index}: {str(e)}"
 
     async def _mark_step_completed(self) -> None:

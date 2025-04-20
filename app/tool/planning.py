@@ -1,9 +1,10 @@
 # tool/planning.py
+from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
+from app.config import config
 from app.exceptions import ToolError
 from app.tool.base import BaseTool, ToolResult
-
 
 _PLANNING_TOOL_DESCRIPTION = """
 A planning tool that allows the agent to create and manage plans for solving complex tasks.
@@ -68,6 +69,18 @@ class PlanningTool(BaseTool):
 
     plans: dict = {}  # Dictionary to store plans by plan_id
     _current_plan_id: Optional[str] = None  # Track the current active plan
+
+    def _write_todo_file(self, content: str) -> None:
+        """Write the formatted plan to todo.md in the workspace root."""
+        try:
+            workspace: Path = config.workspace_root
+            file_path = workspace / "todo.md"
+            workspace.mkdir(parents=True, exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            # Avoid breaking the agent if file write fails
+            print(f"[WARNING] Failed to write todo.md: {e}")
 
     async def execute(
         self,
@@ -359,5 +372,11 @@ class PlanningTool(BaseTool):
             output += f"{i}. {status_symbol} {step}\n"
             if notes:
                 output += f"   Notes: {notes}\n"
+
+        # Persist the current plan to todo.md
+        try:
+            self._write_todo_file(output)
+        except Exception:
+            pass
 
         return output

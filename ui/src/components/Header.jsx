@@ -20,7 +20,7 @@ const Header = () => {
   return (
     <header className="h-16 bg-white border-b border-gray-200 flex items-center px-6">
       <div className="flex items-center">
-        <h1 className="text-xl font-semibold text-gray-800">OpenManus</h1>
+        <h1 className="text-xl font-semibold text-gray-800">OpenAgent</h1>
         <span className="ml-2 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-brand-100 text-brand-800">
           Интеллектуальный помощник
         </span>

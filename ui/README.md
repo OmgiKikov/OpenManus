@@ -1,6 +1,6 @@
-# OpenManus UI
+# OpenAgent UI
 
-A modern React-based user interface for OpenManus intelligent assistant, featuring a chat interface, browser preview, logging system, and file management capabilities.
+A modern React-based user interface for OpenAgent intelligent assistant, featuring a chat interface, browser preview, logging system, and file management capabilities.
 
 ## Features
 
@@ -133,7 +133,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Built with [Create React App](https://create-react-app.dev/)
 - Styled with [Tailwind CSS](https://tailwindcss.com/)
 - Icons from [Heroicons](https://heroicons.com/)
-- Inspired by @mannaandpoem project 
+- Inspired by @mannaandpoem project
 
 ## Technical Implementation
 
@@ -378,4 +378,4 @@ The browser component implements several security measures:
 2. Virtualized list rendering for logs
 3. Lazy loading of components
 4. Optimized re-renders using React.memo
-5. Efficient state updates using functional updates 
+5. Efficient state updates using functional updates

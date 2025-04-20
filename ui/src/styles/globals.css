@@ -3,8 +3,17 @@
 @tailwind utilities;
 
 @keyframes pulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: .5; transform: scale(1.1); }
+
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: .5;
+    transform: scale(1.1);
+  }
 }
 
 .thinking-dot {
@@ -44,4 +53,4 @@
 
 .paused {
   color: #f59e0b;
-} 
+}
