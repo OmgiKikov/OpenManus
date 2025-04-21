@@ -12,7 +12,11 @@ from app.llm import LLM
 from app.logger import logger
 from app.schema import AgentState, Message, ToolChoice
 from app.tool import PlanningTool
+from app.tool.ask_human import AskHuman
 from app.tool.base import ToolResult
+
+# Специальный сигнал для human-in-the-loop
+HUMAN_INTERACTION_SIGNAL = "__HUMAN_INTERACTION_OCCURRED__"
 
 
 class PlanStepStatus(str, Enum):
@@ -45,13 +49,17 @@ class PlanStepStatus(str, Enum):
 
 
 class PlanningFlow(BaseFlow):
-    """A flow that manages planning and execution of tasks using agents."""
+    """
+    Production-ready flow for planning and executing complex tasks with agents, LLM, and human-in-the-loop.
+    Implements best practices for Manus.AI: retry, human-in-the-loop, tool-based planning, robust logging, and summary.
+    """
 
     llm: LLM = Field(default_factory=lambda: LLM())
     planning_tool: PlanningTool = Field(default_factory=PlanningTool)
     executor_keys: List[str] = Field(default_factory=list)
     active_plan_id: str = Field(default_factory=lambda: f"plan_{int(time.time())}")
     current_step_index: Optional[int] = None
+    max_retries_per_step: int = 3
 
     def __init__(
         self, agents: Union[BaseAgent, List[BaseAgent], Dict[str, BaseAgent]], **data
@@ -94,165 +102,101 @@ class PlanningFlow(BaseFlow):
         return self.primary_agent
 
     async def execute(self, input_text: str) -> str:
-        """Execute the planning flow with agents using the Manus iterative agent loop."""
+        """
+        Main execution loop: creates plan, executes steps with retry/human-in-the-loop, finalizes with LLM summary.
+        """
         try:
             if not self.primary_agent:
                 raise ValueError("No primary agent available")
-
             result = ""
-            # If there's input text, update existing plan or create a new one
             if input_text:
-                if self.active_plan_id in self.planning_tool.plans:
-                    # Update existing plan
-                    result += await self._update_plan_from_message(input_text)
+                await self._create_initial_plan(input_text)
+                if self.active_plan_id not in self.planning_tool.plans:
+                    logger.error(
+                        f"Plan creation failed. Plan ID {self.active_plan_id} not found in planning tool."
+                    )
+                    return f"Failed to create plan for: {input_text}"
+            current_step_retries = 0
+            last_step_index = -1
+            while True:
+                self.current_step_index, step_info = await self._get_current_step_info()
+                if self.current_step_index != last_step_index:
+                    current_step_retries = 0
+                    last_step_index = self.current_step_index
                 else:
-                    # Create new plan
-                    await self._create_initial_plan(input_text)
-                    # Check creation success
-                    if self.active_plan_id not in self.planning_tool.plans:
-                        logger.error(
-                            f"Plan creation failed. Plan ID {self.active_plan_id} not found in planning tool."
-                        )
-                        return f"Failed to create plan for: {input_text}"
-                    result += await self._get_plan_text()
-
-            # Manus Iterative Agent Loop
-            # Instead of executing all steps at once, we'll execute one step per iteration
-            # and then decide whether to continue based on the results
-
-            # 1. ANALYZE: Get the current state and identify next step
-            self.current_step_index, step_info = await self._get_current_step_info()
-
-            # Exit if no more steps or plan completed
-            if self.current_step_index is None:
-                result += await self._finalize_plan()
-                return result
-
-            # 2. PLAN: Determine how to execute the current step
-            step_type = step_info.get("type") if step_info else None
-            executor = self.get_executor(step_type)
-
-            # Get step content and prepare context
-            step_content = step_info.get("content", "Unknown step")
-            logger.info(f"Executing step {self.current_step_index + 1}: {step_content}")
-
-            # Update step status to in_progress
-            await self.planning_tool.execute(
-                command="mark_step",
-                plan_id=self.active_plan_id,
-                step_index=self.current_step_index,
-                step_status="in_progress",
-            )
-
-            # 3. EXECUTE: Execute the step with the appropriate agent
-            step_result = await self._execute_step(executor, step_info)
-            result += f"Step {self.current_step_index + 1} result:\n{step_result}\n"
-
-            # 4. OBSERVE: Evaluate the step result and update plan accordingly
-            step_success = await self._evaluate_step_result(step_result)
-
-            if step_success:
-                # Mark step as completed
-                await self._mark_step_completed()
+                    current_step_retries += 1
+                if self.current_step_index is None:
+                    result += await self._finalize_plan()
+                    break
+                if current_step_retries >= self.max_retries_per_step:
+                    logger.error(
+                        f"Maximum retries ({self.max_retries_per_step}) exceeded for step {self.current_step_index}. Aborting."
+                    )
+                    await self._mark_step_status(
+                        PlanStepStatus.BLOCKED.value, "Max retries exceeded"
+                    )
+                    result += (
+                        "\nExecution aborted: Maximum retries exceeded for a step."
+                    )
+                    break
+                step_type = step_info.get("type") if step_info else None
+                executor = self.get_executor(step_type)
                 logger.info(
-                    f"Step {self.current_step_index + 1} completed successfully"
+                    f"Executing step {self.current_step_index} (Retry: {current_step_retries})"
                 )
-            else:
-                # Mark step as blocked if execution failed
-                await self.planning_tool.execute(
-                    command="mark_step",
-                    plan_id=self.active_plan_id,
-                    step_index=self.current_step_index,
-                    step_status="blocked",
-                    step_notes=f"Execution failed: {step_result[:100]}...",
-                )
-                logger.warning(f"Step {self.current_step_index + 1} execution failed")
-
-            # Return the current plan status
-            result += await self._get_plan_text()
+                step_result = await self._execute_step(executor, step_info)
+                if step_result == HUMAN_INTERACTION_SIGNAL:
+                    logger.info(
+                        f"Human interaction occurred for step {self.current_step_index}. Retrying step."
+                    )
+                    continue
+                result += step_result + "\n"
+                if hasattr(executor, "state") and executor.state == AgentState.FINISHED:
+                    logger.warning(
+                        f"Executor {executor.name} entered FINISHED state. Stopping flow."
+                    )
+                    break
             return result
-
         except Exception as e:
             logger.error(f"Error in PlanningFlow: {str(e)}")
             return f"Execution failed: {str(e)}"
 
-    async def _evaluate_step_result(self, step_result: str) -> bool:
-        """
-        Evaluate the result of a step execution to determine if it was successful.
-        This method can be extended to implement more sophisticated evaluation.
-
-        Args:
-            step_result: The result string from step execution
-
-        Returns:
-            bool: True if the step was successful, False otherwise
-        """
-        # Simple implementation - consider the step successful unless it contains explicit failure indicators
-        failure_indicators = [
-            "error:",
-            "failed:",
-            "exception:",
-            "could not",
-            "unable to",
-            "execution failed",
-            "terminated with code",
-            "critical failure",
-        ]
-
-        # Check for failure indicators (case-insensitive)
-        step_result_lower = step_result.lower()
-        for indicator in failure_indicators:
-            if indicator in step_result_lower:
-                return False
-
-        return True
-
     async def _create_initial_plan(self, request: str) -> None:
         """
-        Create an initial plan based on the request using the flow's LLM and PlanningTool.
-        Generates a structured plan with detailed steps following the Manus architecture.
+        Create an initial plan using LLM and PlanningTool. Only tool call is accepted. Strict system prompt.
         """
         logger.info(f"Creating initial plan with ID: {self.active_plan_id}")
-
-        # Create a system message with specific planning instructions
         system_message = Message.system_message(
             """
-You are a planning assistant responsible for breaking down complex tasks into clear, achievable steps.
-Your plans should follow these principles:
-
-1. Break tasks into 3-7 concrete, actionable steps
-2. Each step should produce a clear output or state change
-3. Steps should be sequential and dependent on previous steps
-4. Include enough detail for execution without being too granular
-5. Ensure steps are measurable and have clear completion criteria
-
-For technical tasks:
-- Start with information gathering/analysis steps
-- Include validation/testing steps
-- End with summarization or result delivery steps
-
-Format steps as imperative statements ("Analyze data", not "Data will be analyzed").
+You are an expert planning assistant. Your goal is to create a detailed, step-by-step plan to accomplish a given task using available tools.
+<planning_approach>
+1.  **Decomposition:** Break down the main task into smaller, logically ordered, actionable steps. Each step should represent a clear, manageable unit of work. Avoid overly broad or vague steps.
+2.  **Tool Awareness (Implicit):** Although you don't need to specify exact tool calls in the plan, formulate steps in a way that they likely correspond to actions achievable with tools like web search, browsing, code execution, or file manipulation. (For example, "Search for reviews of product X", "Extract key features from webpage Y", "Write a Python script to analyze data Z").
+3.  **Clarity and Order:** Ensure the steps are in a logical sequence. The output of one step might be needed for the next.
+4.  **Completeness:** The plan should cover all necessary stages from start to finish to fully address the user's request.
+5.  **Conciseness:** While detailed, avoid unnecessary verbosity in step descriptions.
+</planning_approach>
+<output_format>
+- You MUST call the 'planning' tool to submit the generated plan.
+- Provide the plan as a list of strings in the 'steps' parameter of the tool call.
+- Provide a concise 'title' for the plan.
+</output_format>
+Analyze the user's request carefully and generate the plan by calling the 'planning' tool.
 """
         )
-
-        # Create a user message with the request
         user_message = Message.user_message(
-            f"Create a clear, actionable plan with sequential steps to accomplish this task: {request}"
+            f"Create a detailed, step-by-step plan to accomplish the task: {request}"
         )
-
-        # Call LLM with PlanningTool
         response = await self.llm.ask_tool(
             messages=[user_message],
             system_msgs=[system_message],
             tools=[self.planning_tool.to_param()],
             tool_choice=ToolChoice.AUTO,
+            temperature=0.2,
         )
-
-        # Process tool calls if present
         if response.tool_calls:
             for tool_call in response.tool_calls:
                 if tool_call.function.name == "planning":
-                    # Parse the arguments
                     args = tool_call.function.arguments
                     if isinstance(args, str):
                         try:
@@ -260,128 +204,21 @@ Format steps as imperative statements ("Analyze data", not "Data will be analyze
                         except json.JSONDecodeError:
                             logger.error(f"Failed to parse tool arguments: {args}")
                             continue
-
-                    # Ensure plan_id is set correctly and execute the tool
                     args["plan_id"] = self.active_plan_id
-
-                    # Make sure the title is not too long
-                    if "title" in args and len(args["title"]) > 100:
-                        args["title"] = args["title"][:97] + "..."
-
-                    # Add plan description if not present
-                    if "title" in args and "steps" in args:
-                        # Execute the tool via ToolCollection instead of directly
-                        result = await self.planning_tool.execute(**args)
-                        logger.info(f"Plan creation result: {str(result)}")
-                        return
-
-        # If no valid tool call was processed, create a default plan with basic steps
-        logger.warning("No valid planning tool calls found, creating default plan")
-
-        # Create a simplified title from the request
-        title = f"Plan for: {request[:50]}{'...' if len(request) > 50 else ''}"
-
-        # Create default steps for any task
-        default_steps = [
-            "Analyze and understand the requirements",
-            "Research needed information and gather resources",
-            "Create implementation plan with specific deliverables",
-            "Execute the implementation",
-            "Test and validate results",
-            "Summarize findings and deliver results",
-        ]
-
-        # Create default plan
+                    await self.planning_tool.execute(**args)
+                    logger.info(f"Plan creation result: {args}")
+                    return
+        logger.warning("Creating default plan")
         await self.planning_tool.execute(
             command="create",
             plan_id=self.active_plan_id,
-            title=title,
-            steps=default_steps,
+            title=f"Plan for: {request[:50]}{'...' if len(request) > 50 else ''}",
+            steps=["Analyze request", "Execute task", "Verify results"],
         )
-
-    async def _update_plan_from_message(self, message: str) -> str:
-        """
-        Update existing plan based on a new user message.
-
-        This method allows users to modify plans by adding steps, changing existing steps,
-        or providing additional context/requirements.
-        """
-        logger.info(
-            f"Updating plan {self.active_plan_id} based on new message: {message}"
-        )
-
-        # Get the current plan for context
-        current_plan = await self._get_plan_text()
-
-        # Prepare system message with specific update instructions
-        system_message = Message.system_message(
-            """
-You are a planning assistant responsible for updating existing plans based on new user input.
-You should maintain the overall structure of the plan while incorporating the user's feedback.
-
-When updating a plan:
-1. Keep completed steps unchanged when possible
-2. Add new steps where necessary
-3. Modify future steps to accommodate new requirements
-4. Break down complex steps into smaller ones if needed
-5. Ensure all steps remain concrete and actionable
-
-Respond by making the appropriate changes to the plan structure.
-"""
-        )
-
-        # Create user message with context and new input
-        user_message = Message.user_message(
-            f"""
-Current plan:
-{current_plan}
-
-User wants to update this plan with the following:
-{message}
-
-Please update the plan appropriately.
-"""
-        )
-
-        # Call LLM with PlanningTool for plan updates
-        response = await self.llm.ask_tool(
-            messages=[user_message],
-            system_msgs=[system_message],
-            tools=[self.planning_tool.to_param()],
-            tool_choice=ToolChoice.AUTO,
-        )
-
-        # Process tool calls if present
-        if response.tool_calls:
-            for tool_call in response.tool_calls:
-                if tool_call.function.name == "planning":
-                    # Parse the arguments
-                    args = tool_call.function.arguments
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse arguments: {args}")
-                            continue
-
-                    # Ensure plan_id is set correctly
-                    args["plan_id"] = self.active_plan_id
-
-                    # Execute the planning tool with the parsed arguments
-                    result: ToolResult = await self.planning_tool.execute(**args)
-                    logger.info(f"Plan update result: {result.output}")
-
-                    # Return the updated plan text
-                    return result.output
-
-        # If no valid tool calls were processed, return the current plan with a note
-        logger.warning("No valid planning tool calls returned, keeping current plan.")
-        return f"No updates made to plan. Current plan:\n\n{current_plan}"
 
     async def _get_current_step_info(self) -> tuple[Optional[int], Optional[dict]]:
         """
-        Parse the current plan to identify the first non-completed step's index and info.
-        Returns (None, None) if no active step is found.
+        Returns index and info of the first non-completed step. None if all done.
         """
         if (
             not self.active_plan_id
@@ -389,214 +226,175 @@ Please update the plan appropriately.
         ):
             logger.error(f"Plan with ID {self.active_plan_id} not found")
             return None, None
-
         try:
-            # Direct access to plan data from planning tool storage
             plan_data = self.planning_tool.plans[self.active_plan_id]
             steps = plan_data.get("steps", [])
             step_statuses = plan_data.get("step_statuses", [])
-
-            # Find first non-completed step
             for i, step in enumerate(steps):
-                if i >= len(step_statuses):
-                    status = PlanStepStatus.NOT_STARTED.value
-                else:
-                    status = step_statuses[i]
-
+                status = (
+                    step_statuses[i]
+                    if i < len(step_statuses)
+                    else PlanStepStatus.NOT_STARTED.value
+                )
                 if status in PlanStepStatus.get_active_statuses():
-                    # Extract step type/category if available
                     step_info = {"text": step}
-
-                    # Try to extract step type from the text (e.g., [SEARCH] or [CODE])
                     import re
 
                     type_match = re.search(r"\[([A-Z_]+)\]", step)
                     if type_match:
                         step_info["type"] = type_match.group(1).lower()
-
-                    # Mark current step as in_progress
-                    try:
-                        await self.planning_tool.execute(
-                            command="mark_step",
-                            plan_id=self.active_plan_id,
-                            step_index=i,
-                            step_status=PlanStepStatus.IN_PROGRESS.value,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Error marking step as in_progress: {e}")
-                        # Update step status directly if needed
-                        if i < len(step_statuses):
-                            step_statuses[i] = PlanStepStatus.IN_PROGRESS.value
-                        else:
-                            while len(step_statuses) < i:
-                                step_statuses.append(PlanStepStatus.NOT_STARTED.value)
-                            step_statuses.append(PlanStepStatus.IN_PROGRESS.value)
-
-                        plan_data["step_statuses"] = step_statuses
-
+                    await self._mark_step_status(PlanStepStatus.IN_PROGRESS.value)
                     return i, step_info
-
-            return None, None  # No active step found
-
+            return None, None
         except Exception as e:
             logger.warning(f"Error finding current step index: {e}")
             return None, None
 
     async def _execute_step(self, executor: BaseAgent, step_info: dict) -> str:
         """
-        Execute a single step of the plan using the specified agent.
-
-        Args:
-            executor: The agent that will execute the step
-            step_info: Information about the step to execute
-
-        Returns:
-            str: The result of the step execution
+        Execute the current step with the specified agent. Handles human-in-the-loop and all errors.
         """
-        if not step_info:
-            return "No step information provided"
+        plan_status = await self._get_plan_text()
+        step_text = step_info.get("text", f"Step {self.current_step_index}")
+        step_prompt = f"""
+CURRENT PLAN STATUS:
+{plan_status}
 
-        # Extract step content and step number
-        step_content = step_info.get("content", "")
-        step_index = self.current_step_index
+YOUR CURRENT TASK:
+You are now working on step {self.current_step_index}: \"{step_text}\"
 
-        # Get the full plan context for the agent
-        plan_context = self._generate_plan_text_from_storage()
-
-        # Create a context message that includes:
-        # 1. The current plan status and progress
-        # 2. The specific step being executed
-        # 3. Any relevant information from previous steps
-
-        context_message = (
-            f"You are currently executing a plan with the following information:\n\n"
-            f"{plan_context}\n\n"
-            f"CURRENT TASK: Execute Step {step_index + 1}: {step_content}\n\n"
-            "You should complete this specific step only, not the entire plan. "
-            "Focus on producing a concrete, actionable result for this step. "
-            "If you need more information, specify what's missing."
-        )
-
+YOUR OBJECTIVE:
+1. Execute the current step using the appropriate tools.
+2. **Analyze recent messages (especially user responses).** If information from the user indicates that any **FUTURE** steps in the plan (check CURRENT PLAN STATUS) are already completed or irrelevant, you MUST use the 'planning' tool to update their status BEFORE proceeding with the current step's main action.
+   - Use command 'mark_step' with the correct 'step_index' for each future step that needs updating.
+   - Set 'status' to 'completed' or 'blocked'.
+   - Add a brief explanation in 'step_notes' (e.g., 'User confirmed completion', 'Made irrelevant by user input').
+3. If you get stuck on the current step (e.g., after 2-3 failed attempts), need information you cannot find, or require a user decision, use the 'ask_human' tool.
+4. When you are finished with this step (either successfully, by updating future steps, or by asking the human), provide a summary of what you accomplished or why you need help.
+"""
         try:
-            # Execute the step with the constructed context
-            step_result = await executor.run(context_message)
-
-            # Format the step result
-            formatted_result = (
-                f"Step {step_index + 1} completed.\n\n" f"Result:\n{step_result}\n\n"
-            )
-
-            # Add notes if needed
-            notes = f"Executed by {executor.__class__.__name__}"
-            await self.planning_tool.execute(
-                command="mark_step",
-                plan_id=self.active_plan_id,
-                step_index=step_index,
-                step_notes=notes,
-            )
-
-            return formatted_result
-
+            step_result_str = await executor.run(step_prompt)
+            await self._mark_step_status(PlanStepStatus.COMPLETED.value)
+            return step_result_str
         except Exception as e:
-            error_message = f"Step {step_index + 1} execution failed: {str(e)}"
-            logger.error(error_message)
-            return error_message
+            # Human-in-the-loop: если агент вызывает AskHuman через input или исключение
+            if "ask_human" in str(e).lower() or isinstance(e, KeyboardInterrupt):
+                logger.info(
+                    f"Agent requested human input for step {self.current_step_index}"
+                )
+                try:
+                    user_response = input(
+                        f'\n🤖 Agent needs help with step {self.current_step_index} ("{step_text}"):\n   Question: {str(e)}\n👤 Your answer: '
+                    )
+                except EOFError:
+                    logger.warning("EOF received, assuming no input.")
+                    user_response = "(No input provided)"
+                executor.update_memory(
+                    role="user", content=f"Regarding your question: {user_response}"
+                )
+                logger.info("User response injected into agent memory.")
+                return HUMAN_INTERACTION_SIGNAL
+            logger.error(
+                f"Unexpected error during agent execution for step {self.current_step_index}: {e}"
+            )
+            await self._mark_step_status(
+                PlanStepStatus.BLOCKED.value, f"Agent execution error: {str(e)}"
+            )
+            return f"Error during agent execution for step {self.current_step_index}: {str(e)}"
 
-    async def _mark_step_completed(self) -> None:
-        """Mark the current step as completed."""
+    async def _mark_step_status(self, status: str, notes: Optional[str] = None) -> None:
+        """
+        Universal function to mark the current step with any status and optional notes.
+        """
         if self.current_step_index is None:
             return
-
         try:
-            # Mark the step as completed
             await self.planning_tool.execute(
                 command="mark_step",
                 plan_id=self.active_plan_id,
                 step_index=self.current_step_index,
-                step_status=PlanStepStatus.COMPLETED.value,
+                step_status=status,
+                step_notes=notes,
             )
             logger.info(
-                f"Marked step {self.current_step_index} as completed in plan {self.active_plan_id}"
+                f"Marked step {self.current_step_index} as {status} in plan {self.active_plan_id}"
             )
         except Exception as e:
-            logger.warning(f"Failed to update plan status: {e}")
-            # Update step status directly in planning tool storage
+            logger.warning(f"Failed to update plan status to {status}: {e}")
             if self.active_plan_id in self.planning_tool.plans:
                 plan_data = self.planning_tool.plans[self.active_plan_id]
                 step_statuses = plan_data.get("step_statuses", [])
-
-                # Ensure the step_statuses list is long enough
+                step_notes_list = plan_data.get("step_notes", [])
                 while len(step_statuses) <= self.current_step_index:
                     step_statuses.append(PlanStepStatus.NOT_STARTED.value)
-
-                # Update the status
-                step_statuses[self.current_step_index] = PlanStepStatus.COMPLETED.value
+                while len(step_notes_list) <= self.current_step_index:
+                    step_notes_list.append("")
+                step_statuses[self.current_step_index] = status
+                if notes:
+                    step_notes_list[self.current_step_index] = notes
                 plan_data["step_statuses"] = step_statuses
+                plan_data["step_notes"] = step_notes_list
 
     async def _get_plan_text(self) -> str:
-        """Get the current plan as formatted text."""
+        """
+        Get the current plan as formatted markdown and save to todo.md.
+        """
         try:
             result = await self.planning_tool.execute(
                 command="get", plan_id=self.active_plan_id
             )
-            return result.output if hasattr(result, "output") else str(result)
+            # Сохраняем в todo.md
+            if hasattr(result, "output"):
+                self.planning_tool._write_todo_file(result.output)
+                return result.output
+            else:
+                return str(result)
         except Exception as e:
             logger.error(f"Error getting plan: {e}")
             return self._generate_plan_text_from_storage()
 
     def _generate_plan_text_from_storage(self) -> str:
-        """Generate plan text directly from storage if the planning tool fails."""
+        """
+        Fallback: generate plan text directly from storage if the planning tool fails.
+        """
         try:
             if self.active_plan_id not in self.planning_tool.plans:
                 return f"Error: Plan with ID {self.active_plan_id} not found"
-
             plan_data = self.planning_tool.plans[self.active_plan_id]
             title = plan_data.get("title", "Untitled Plan")
             steps = plan_data.get("steps", [])
             step_statuses = plan_data.get("step_statuses", [])
             step_notes = plan_data.get("step_notes", [])
-
-            # Ensure step_statuses and step_notes match the number of steps
             while len(step_statuses) < len(steps):
                 step_statuses.append(PlanStepStatus.NOT_STARTED.value)
             while len(step_notes) < len(steps):
                 step_notes.append("")
-
-            # Count steps by status
             status_counts = {status: 0 for status in PlanStepStatus.get_all_statuses()}
-
             for status in step_statuses:
                 if status in status_counts:
                     status_counts[status] += 1
-
             completed = status_counts[PlanStepStatus.COMPLETED.value]
             total = len(steps)
             progress = (completed / total) * 100 if total > 0 else 0
-
             plan_text = f"Plan: {title} (ID: {self.active_plan_id})\n"
             plan_text += "=" * len(plan_text) + "\n\n"
-
             plan_text += (
                 f"Progress: {completed}/{total} steps completed ({progress:.1f}%)\n"
             )
             plan_text += f"Status: {status_counts[PlanStepStatus.COMPLETED.value]} completed, {status_counts[PlanStepStatus.IN_PROGRESS.value]} in progress, "
             plan_text += f"{status_counts[PlanStepStatus.BLOCKED.value]} blocked, {status_counts[PlanStepStatus.NOT_STARTED.value]} not started\n\n"
             plan_text += "Steps:\n"
-
             status_marks = PlanStepStatus.get_status_marks()
-
             for i, (step, status, notes) in enumerate(
                 zip(steps, step_statuses, step_notes)
             ):
-                # Use status marks to indicate step status
                 status_mark = status_marks.get(
                     status, status_marks[PlanStepStatus.NOT_STARTED.value]
                 )
-
                 plan_text += f"{i}. {status_mark} {step}\n"
                 if notes:
                     plan_text += f"   Notes: {notes}\n"
-
+            self.planning_tool._write_todo_file(plan_text)
             return plan_text
         except Exception as e:
             logger.error(f"Error generating plan text from storage: {e}")
@@ -604,76 +402,23 @@ Please update the plan appropriately.
 
     async def _finalize_plan(self) -> str:
         """
-        Generate a final summary of the completed plan.
-        This method is called when all steps are completed or when execution terminates.
-
-        Returns:
-            str: A summary of the plan execution including results and outcomes
+        Finalize the plan and provide a summary using the flow's LLM directly. Also saves summary to todo.md.
         """
-        if (
-            not self.active_plan_id
-            or self.active_plan_id not in self.planning_tool.plans
-        ):
-            return "Plan not found or invalid."
-
-        plan_data = self.planning_tool.plans[self.active_plan_id]
-        title = plan_data.get("title", "Untitled Plan")
-        steps = plan_data.get("steps", [])
-        statuses = plan_data.get("step_statuses", [])
-        notes = plan_data.get("step_notes", [])
-
-        # Calculate plan completion statistics
-        total_steps = len(steps)
-        completed_steps = statuses.count("completed")
-        blocked_steps = statuses.count("blocked")
-        success_rate = (completed_steps / total_steps * 100) if total_steps > 0 else 0
-
-        # Generate a formatted summary
-        summary = f"# Plan Summary: {title}\n\n"
-
-        # Add completion status
-        if completed_steps == total_steps:
-            summary += "## ✅ Plan Completed Successfully\n\n"
-        elif blocked_steps > 0:
-            summary += f"## ⚠️ Plan Partially Completed ({success_rate:.1f}%)\n\n"
-        else:
-            summary += f"## ℹ️ Plan Execution Status: {success_rate:.1f}% Complete\n\n"
-
-        # Add statistics
-        summary += f"- Total Steps: {total_steps}\n"
-        summary += f"- Completed Steps: {completed_steps}\n"
-        summary += f"- Blocked Steps: {blocked_steps}\n"
-        summary += f"- Success Rate: {success_rate:.1f}%\n\n"
-
-        # Add step details
-        summary += "## Step Details\n\n"
-
-        for i, (step, status, note) in enumerate(zip(steps, statuses, notes)):
-            status_icon = {
-                "completed": "✓",
-                "in_progress": "→",
-                "blocked": "⚠",
-                "not_started": "○",
-            }.get(status, "○")
-
-            summary += f"### Step {i+1}: [{status_icon}] {step}\n"
-            summary += f"**Status**: {status.capitalize()}\n"
-
-            if note:
-                summary += f"**Notes**: {note}\n"
-
-            summary += "\n"
-
-        # Write summary to a file
+        plan_text = await self._get_plan_text()
         try:
-            workspace = config.workspace_root
-            summary_path = workspace / "plan_summary.md"
-            with open(summary_path, "w", encoding="utf-8") as f:
-                f.write(summary)
-
-            # Add reference to the summary file
-            summary += f"\nDetailed summary saved to: {summary_path}\n"
+            system_message = Message.system_message(
+                "You are a planning assistant. Your task is to summarize the completed plan."
+            )
+            user_message = Message.user_message(
+                f"The plan has been completed. Here is the final plan status:\n\n{plan_text}\n\nPlease provide a summary of what was accomplished and any final thoughts."
+            )
+            response = await self.llm.ask(
+                messages=[user_message], system_msgs=[system_message]
+            )
+            summary = f"Plan completed:\n\n{response}"
+            self.planning_tool._write_todo_file(plan_text + "\n\n" + summary)
+            return summary
         except Exception as e:
-            logger.error(f"Failed to write plan summary: {e}")
-
-        return summary
+            logger.error(f"Error finalizing plan with LLM: {e}")
+            self.planning_tool._write_todo_file(plan_text)
+            return "Plan completed. Error generating summary."

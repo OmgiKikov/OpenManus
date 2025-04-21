@@ -1,46 +1,49 @@
-import asyncio
-import inspect
+# app/tool/ask_human.py
+from typing import Literal
 
-from app.human_queue import human_queue
-from app.logger import logger
-from app.tool import BaseTool
+from app.tool.base import BaseTool, ToolResult
+
+
+class HumanInterventionRequired(Exception):
+    """
+    Custom exception to signal that human input is needed during agent/tool execution.
+    Carries the question and tool_call_id for context.
+    """
+
+    def __init__(self, question: str, tool_call_id: str):
+        self.question = question
+        self.tool_call_id = tool_call_id
+        super().__init__(question)
 
 
 class AskHuman(BaseTool):
-    """Add a tool to ask human for help."""
+    """
+    A tool that allows the agent to pause execution and ask the human user for input,
+    clarification, or a decision when blocked or needing guidance.
+    Always raises HumanInterventionRequired, which should be caught by the flow/agent.
+    """
 
     name: str = "ask_human"
-    description: str = "Use this tool to ask human for help."
-    parameters: str = {
+    description: str = (
+        "Asks the human user for input, clarification, or a decision. "
+        "Use this when you are blocked (e.g., after 2-3 failed attempts on a step), need information you cannot find, "
+        "or require a decision that only the user can make (e.g., ambiguous instructions, choice between options). "
+        "Formulate a clear and specific question for the user."
+    )
+    parameters: dict = {
         "type": "object",
         "properties": {
-            "inquire": {
+            "question": {
+                "description": "The specific question to ask the human user.",
                 "type": "string",
-                "description": "The question you want to ask human.",
             }
         },
-        "required": ["inquire"],
+        "required": ["question"],
     }
 
-    async def execute(self, inquire: str) -> str:
-        # Get the current task_id from the logger context
-        task_id = logger._current_task_id
-        if not task_id:
-            # Fallback to direct input if no task context (e.g. during testing)
-            return input(f"""Bot: {inquire}\n\nYou: """).strip()
-
-        # Log the question so it appears in the chat
-        logger.info(f"[ASK_HUMAN] {inquire}")
-
-        # Add the question to the queue and get a future for the response
-        future = human_queue.add_question(task_id, inquire)
-
-        # Wait for the response
-        try:
-            # Wait for the human to respond
-            response = await future
-            return response.strip()
-        except asyncio.CancelledError:
-            # Handle cancellation (e.g., if the task is interrupted)
-            logger.warning("Human question was cancelled before receiving a response")
-            return "Question was cancelled"
+    async def execute(self, *, question: str, **kwargs) -> ToolResult:
+        """
+        Always signals that human intervention is required by raising HumanInterventionRequired.
+        The flow/agent should catch this exception and handle the user interaction.
+        """
+        raise HumanInterventionRequired(question=question, tool_call_id="UNKNOWN")
