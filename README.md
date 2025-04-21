@@ -1,16 +1,13 @@
-
-
-## Installation
-
+## Run
 ### Docker 
-
 ``` bash
 git clone ...
 cd OpenManus
 docker build -t openmanus . && docker run -d -p 80:3000 openmanus
 ```
 
-### Manual method: Using uv (Recommended)
+## Manual installation
+### Using uv (Recommended)
 
 1. Install uv (A fast Python package installer and resolver):
 
