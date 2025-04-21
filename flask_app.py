@@ -173,24 +173,24 @@ def run_async_task(task_id, coro):
 
 @app.route("/api/send", methods=["POST"])
 def send_message():
-    # 确保agent已初始化
+    # Ensure agent is initialized
     initialize_agent()
 
-    # 获取用户消息
+    # Get user message
     data = request.json
     message = data.get("message", "").strip()
-    # 获取可选 flow_type, 默认为 default
+    # Get optional flow_type, default is "default"
     flow_type = data.get("flow_type", "default").strip().lower()
-    # 获取可选 plan_id, если нет — создаём новый
+    # Get optional plan_id, create new if not provided
     plan_id = data.get("plan_id") or str(uuid.uuid4())
 
     if not message:
-        return jsonify({"status": "error", "message": "消息不能为空"}), 400
+        return jsonify({"status": "error", "message": "Message cannot be empty"}), 400
 
-    # 创建任务ID
+    # Create task ID
     task_id = str(uuid.uuid4())
 
-    # 创建任务
+    # Create task
     active_tasks[task_id] = {
         "message": message,
         "created_at": time.time(),
@@ -198,14 +198,25 @@ def send_message():
         "plan_id": plan_id,
     }
 
-    # 启动异步处理线程
+    # Add info log
+    logger.info(f"New task created: {task_id}, flow: {flow_type}, plan: {plan_id}")
+    logger.info(f"Message: {message[:100]}{'...' if len(message) > 100 else ''}")
+
+    # Start asynchronous processing thread
     thread = threading.Thread(
         target=run_async_task,
         args=(task_id, process_prompt(task_id, message)),
     )
     thread.start()
 
-    return jsonify({"status": "processing", "task_id": task_id, "plan_id": plan_id})
+    return jsonify(
+        {
+            "status": "processing",
+            "task_id": task_id,
+            "plan_id": plan_id,
+            "flow_type": flow_type,
+        }
+    )
 
 
 @app.route("/api/status/<task_id>", methods=["GET"])
@@ -238,11 +249,91 @@ def check_status(task_id):
 # Endpoint to fetch the current todo plan
 @app.route("/api/todo", methods=["GET"])
 def get_todo():
+    """
+    Retrieve the current plan from todo.md with additional metadata.
+    Supports query parameters:
+    - plan_id: Optional specific plan ID to retrieve
+    - format: Optional format (markdown or json, default: markdown)
+    """
+    plan_id = request.args.get("plan_id")
+    output_format = request.args.get("format", "markdown").lower()
+
+    # Default path to todo.md
     todo_path = Path(config.workspace_root) / "todo.md"
+
+    # If we have an active PlanningTool instance available, use it to get plan data
+    try:
+        from app.flow.flow_factory import FlowFactory, FlowType
+
+        flow = FlowFactory.create_flow(
+            flow_type=FlowType.PLANNING, agents={"manus": manus_agent}
+        )
+
+        if hasattr(flow, "planning_tool") and flow.planning_tool:
+            planning_tool = flow.planning_tool
+
+            # If plan_id is specified, get that specific plan
+            if plan_id and plan_id in planning_tool.plans:
+                plan_data = planning_tool.plans[plan_id]
+
+                if output_format == "json":
+                    # Return JSON data about the plan
+                    steps = plan_data.get("steps", [])
+                    statuses = plan_data.get("step_statuses", [])
+                    notes = plan_data.get("step_notes", [])
+
+                    # Calculate statistics
+                    total_steps = len(steps)
+                    completed = statuses.count("completed") if statuses else 0
+                    in_progress = statuses.count("in_progress") if statuses else 0
+                    blocked = statuses.count("blocked") if statuses else 0
+
+                    # Format step information
+                    formatted_steps = []
+                    for i, (step, status, note) in enumerate(
+                        zip(steps, statuses, notes)
+                    ):
+                        formatted_steps.append(
+                            {
+                                "number": i + 1,
+                                "text": step,
+                                "status": status,
+                                "notes": note,
+                            }
+                        )
+
+                    return jsonify(
+                        {
+                            "plan_id": plan_id,
+                            "title": plan_data.get("title", "Untitled Plan"),
+                            "steps": formatted_steps,
+                            "stats": {
+                                "total": total_steps,
+                                "completed": completed,
+                                "in_progress": in_progress,
+                                "blocked": blocked,
+                                "completion_percentage": (
+                                    (completed / total_steps * 100)
+                                    if total_steps > 0
+                                    else 0
+                                ),
+                            },
+                        }
+                    )
+                else:
+                    # Use the planning tool's formatter
+                    formatted_plan = planning_tool._format_plan(plan_data)
+                    return jsonify({"content": formatted_plan})
+    except Exception as e:
+        logger.error(f"Error retrieving plan data: {str(e)}")
+        # Fall back to reading the file directly
+
+    # If we couldn't get the plan via the planning tool, read the file directly
     if todo_path.exists():
         content = todo_path.read_text(encoding="utf-8")
     else:
-        content = ""
+        content = "No active plan found."
+
     return jsonify({"content": content})
 
 
@@ -299,6 +390,161 @@ def submit_human_response():
             jsonify({"status": "error", "message": "Не удалось обработать ответ"}),
             500,
         )
+
+
+# Endpoint to execute a specific plan step
+@app.route("/api/plan/execute", methods=["POST"])
+def execute_plan_step():
+    """
+    Execute a specific step of a plan.
+
+    Request body parameters:
+    - plan_id: The ID of the plan
+    - step_index: The index of the step to execute (0-based)
+
+    Returns the task_id of the execution task.
+    """
+    # Ensure agent is initialized
+    initialize_agent()
+
+    # Get request data
+    data = request.json
+    plan_id = data.get("plan_id")
+    step_index = data.get("step_index")
+
+    # Validate input
+    if not plan_id:
+        return jsonify({"status": "error", "message": "plan_id is required"}), 400
+
+    if step_index is None:
+        return jsonify({"status": "error", "message": "step_index is required"}), 400
+
+    try:
+        step_index = int(step_index)
+    except ValueError:
+        return (
+            jsonify({"status": "error", "message": "step_index must be an integer"}),
+            400,
+        )
+
+    # Create instruction to execute the specific step
+    instruction = f"Execute step {step_index + 1} of plan {plan_id}"
+
+    # Create task ID
+    task_id = str(uuid.uuid4())
+
+    # Create task
+    active_tasks[task_id] = {
+        "message": instruction,
+        "created_at": time.time(),
+        "flow_type": FlowType.PLANNING.value,
+        "plan_id": plan_id,
+        "step_index": step_index,
+    }
+
+    # Log the execution request
+    logger.info(
+        f"Executing plan step: plan_id={plan_id}, step_index={step_index}, task_id={task_id}"
+    )
+
+    # Create a custom process function for step execution
+    async def process_step_execution(task_id, plan_id, step_index):
+        try:
+            # Create a PlanningFlow instance
+            flow = FlowFactory.create_flow(
+                flow_type=FlowType.PLANNING,
+                agents={"manus": manus_agent},
+                plan_id=plan_id,
+            )
+
+            # Set up logging context
+            logger.set_task_context(task_id, task_logs_queue)
+
+            # Initialize logs queue if not already
+            if task_id not in task_logs_queue:
+                task_logs_queue[task_id] = []
+
+            # Set the step index manually and execute only that step
+            flow.current_step_index = step_index
+
+            # Get the step info
+            _, step_info = await flow._get_current_step_info()
+            if not step_info:
+                error_msg = f"Step {step_index} not found in plan {plan_id}"
+                logger.error(error_msg)
+                task_results[task_id] = {
+                    "status": "error",
+                    "result": error_msg,
+                    "has_logs": True,
+                }
+                return
+
+            # Execute the step
+            executor = flow.get_executor(step_info.get("type"))
+            step_result = await flow._execute_step(executor, step_info)
+
+            # Evaluate result and update step status
+            step_success = await flow._evaluate_step_result(step_result)
+            if step_success:
+                await flow._mark_step_completed()
+                status = "completed"
+            else:
+                await flow.planning_tool.execute(
+                    command="mark_step",
+                    plan_id=plan_id,
+                    step_index=step_index,
+                    step_status="blocked",
+                    step_notes=f"Execution failed: {step_result[:100]}...",
+                )
+                status = "error"
+
+            # Store the result
+            task_results[task_id] = {
+                "status": status,
+                "result": step_result,
+                "has_logs": True,
+                "plan_id": plan_id,
+                "step_index": step_index,
+            }
+
+            logger.info(
+                f"Step execution completed: plan_id={plan_id}, step_index={step_index}, status={status}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error executing step: {str(e)}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+
+            task_results[task_id] = {
+                "status": "error",
+                "result": f"Error executing step: {str(e)}",
+                "has_logs": True,
+            }
+        finally:
+            # Clear logging context
+            logger.clear_task_context()
+
+            # Remove from active tasks
+            if task_id in active_tasks:
+                del active_tasks[task_id]
+
+    # Start asynchronous processing thread
+    thread = threading.Thread(
+        target=run_async_task,
+        args=(task_id, process_step_execution(task_id, plan_id, step_index)),
+    )
+    thread.start()
+
+    return jsonify(
+        {
+            "status": "processing",
+            "task_id": task_id,
+            "plan_id": plan_id,
+            "step_index": step_index,
+        }
+    )
 
 
 # 主程序

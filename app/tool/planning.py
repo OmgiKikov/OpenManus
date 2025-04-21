@@ -333,50 +333,55 @@ class PlanningTool(BaseTool):
         return ToolResult(output=f"Plan '{plan_id}' has been deleted.")
 
     def _format_plan(self, plan: Dict) -> str:
-        """Format a plan for display."""
-        output = f"Plan: {plan['title']} (ID: {plan['plan_id']})\n"
-        output += "=" * len(output) + "\n\n"
+        """Format a plan for display as a structured markdown document."""
+        title = plan.get("title", "Untitled Plan")
+        steps = plan.get("steps", [])
+        statuses = plan.get("step_statuses", [])
+        notes = plan.get("step_notes", [])
 
         # Calculate progress statistics
-        total_steps = len(plan["steps"])
-        completed = sum(1 for status in plan["step_statuses"] if status == "completed")
-        in_progress = sum(
-            1 for status in plan["step_statuses"] if status == "in_progress"
+        total_steps = len(steps)
+        completed_steps = sum(1 for status in statuses if status == "completed")
+        in_progress_steps = sum(1 for status in statuses if status == "in_progress")
+        blocked_steps = sum(1 for status in statuses if status == "blocked")
+
+        progress_percentage = (
+            (completed_steps / total_steps * 100) if total_steps > 0 else 0
         )
-        blocked = sum(1 for status in plan["step_statuses"] if status == "blocked")
-        not_started = sum(
-            1 for status in plan["step_statuses"] if status == "not_started"
-        )
 
-        output += f"Progress: {completed}/{total_steps} steps completed "
-        if total_steps > 0:
-            percentage = (completed / total_steps) * 100
-            output += f"({percentage:.1f}%)\n"
-        else:
-            output += "(0%)\n"
+        # Create status icons map
+        status_icons = {
+            "completed": "✓",
+            "in_progress": "→",
+            "blocked": "⚠",
+            "not_started": "○",
+        }
 
-        output += f"Status: {completed} completed, {in_progress} in progress, {blocked} blocked, {not_started} not started\n\n"
-        output += "Steps:\n"
+        # Build the formatted plan
+        formatted_plan = f"# {title}\n\n"
 
-        # Add each step with its status and notes
-        for i, (step, status, notes) in enumerate(
-            zip(plan["steps"], plan["step_statuses"], plan["step_notes"])
-        ):
-            status_symbol = {
-                "not_started": "[ ]",
-                "in_progress": "[→]",
-                "completed": "[✓]",
-                "blocked": "[!]",
-            }.get(status, "[ ]")
+        # Add progress bar and statistics
+        formatted_plan += f"## Progress: {progress_percentage:.1f}% ({completed_steps}/{total_steps})\n\n"
+        formatted_plan += f"- Completed: {completed_steps}\n"
+        formatted_plan += f"- In Progress: {in_progress_steps}\n"
+        formatted_plan += f"- Blocked: {blocked_steps}\n"
+        formatted_plan += f"- Not Started: {total_steps - completed_steps - in_progress_steps - blocked_steps}\n\n"
 
-            output += f"{i}. {status_symbol} {step}\n"
-            if notes:
-                output += f"   Notes: {notes}\n"
+        # Add plan steps
+        formatted_plan += "## Steps\n\n"
 
-        # Persist the current plan to todo.md
-        try:
-            self._write_todo_file(output)
-        except Exception:
-            pass
+        for i, (step, status, note) in enumerate(zip(steps, statuses, notes)):
+            icon = status_icons.get(status, "○")
+            step_number = i + 1
+            formatted_step = f"{step_number}. [{icon}] {step}"
 
-        return output
+            # Add notes if available
+            if note:
+                formatted_step += f"\n   - Note: {note}"
+
+            formatted_plan += formatted_step + "\n\n"
+
+        # Write the formatted plan to the todo.md file
+        self._write_todo_file(formatted_plan)
+
+        return formatted_plan
