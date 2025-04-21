@@ -24,6 +24,10 @@ class TaskLogger:
         self._task_logs_queue = None
         self._current_task_id = None
 
+    def get_task_id(self) -> Optional[str]:
+        """Get the current task ID from the context"""
+        return self._current_task_id
+
     def _task_sink(self, message):
         """Custom sink to add logs to task queue"""
         if self._task_logs_queue is not None and self._current_task_id is not None:
@@ -31,7 +35,7 @@ class TaskLogger:
             log_entry = {
                 "timestamp": record["time"].timestamp(),
                 "level": record["level"].name,
-                "message": record["message"]
+                "message": record["message"],
             }
             self._task_logs_queue[self._current_task_id].append(log_entry)
 
